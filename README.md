@@ -68,19 +68,27 @@ ocurren **2 o más en menos de 20 segundos**.
 
 ### Elegir el modo
 
-En `detector_somnoliencia.py`, la constante `MODO_SENSOR` define de dónde
-salen los datos:
+Se elige con la opción `--modo` al ejecutar, sin necesidad de editar nada:
 
-| Modo | Para qué sirve | Requiere |
+| Modo | Comando | Requiere |
 |---|---|---|
-| `"simulador"` | Probar sin hardware. Tecla `c` genera un cabezazo. | Nada |
-| `"clasico"` | Bluetooth Clásico (HC-05 / HC-06 con Arduino) | `pip install pyserial` |
-| `"ble"` | Bluetooth Low Energy (ESP32 y similares) | `pip install bleak` |
-| `"desactivado"` | Usar solo la cámara | Nada |
+| Simulador (por defecto) | `python detector_somnoliencia.py` | Nada |
+| Solo cámara | `python detector_somnoliencia.py --modo desactivado` | Nada |
+| Bluetooth Clásico | `python detector_somnoliencia.py --modo clasico --puerto COM5` | `pip install pyserial` |
+| Bluetooth BLE | `python detector_somnoliencia.py --modo ble --nombre-ble MiSensor` | `pip install bleak` |
 
-Viene configurado en `"simulador"` porque el hardware todavía no está
-definido. Si el sensor falla al conectar, el programa **no se cae**: avisa por
-consola y sigue funcionando solo con la cámara.
+Para ver todas las opciones: `python detector_somnoliencia.py --help`
+
+El valor por defecto es `"simulador"` porque el hardware todavía no está
+definido; se puede cambiar en la constante `MODO_SENSOR`.
+
+> **Probar sin hardware:** en modo simulador, apretá **`c`** dos veces con
+> menos de 20 segundos de diferencia y debería saltar la alerta. Si dejás
+> pasar más de 20 segundos entre una y otra, no salta — así verificás que la
+> ventana de tiempo funciona.
+
+Si el sensor falla al conectar, el programa **no se cae**: avisa por consola
+y sigue funcionando solo con la cámara.
 
 ### Formato de datos que debe enviar el sensor
 

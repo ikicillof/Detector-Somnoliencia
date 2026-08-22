@@ -535,7 +535,15 @@ class LectorBLE(LectorBase):
         complicar el programa principal, encapsulamos todo eso acá adentro,
         en su propio hilo."""
         import asyncio
-        from bleak import BleakClient, BleakScanner
+
+        try:
+            from bleak import BleakClient, BleakScanner
+        except ImportError:
+            # La librería no está instalada. Avisamos con un mensaje claro en
+            # vez de dejar que el hilo muera con un error incomprensible.
+            print("ERROR: el modo BLE necesita la libreria 'bleak'.")
+            print("Instalala con:  pip install bleak")
+            return
 
         async def principal():
             dispositivo = await BleakScanner.find_device_by_name(

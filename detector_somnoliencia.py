@@ -84,6 +84,8 @@
 # ==============================================================================
 
 # --- Librerías de la biblioteca estándar de Python (ya vienen instaladas) ---
+import argparse  # Para poder elegir opciones al ejecutar desde la consola,
+                 # sin tener que editar el archivo cada vez.
 import os
 import sys
 import time
@@ -162,6 +164,10 @@ MODELO_NOMBRE_ARCHIVO = "face_landmarker.task"
 #   "ble"         -> Bluetooth Low Energy (ESP32 y sensores modernos).
 #                    Requiere instalar bleak y configurar los datos de abajo.
 #   "desactivado" -> ignora el acelerómetro por completo y usa solo la cámara.
+#
+# Este es el valor POR DEFECTO. También se puede elegir al ejecutar el
+# programa desde la consola, sin tocar el archivo, así:
+#     python detector_somnoliencia.py --modo desactivado
 MODO_SENSOR = "simulador"
 
 # Solo se usa si MODO_SENSOR es "clasico". Es el puerto COM que Windows le
@@ -434,8 +440,57 @@ def dibujar_info_debug(frame, ear_promedio, frames_ojos_cerrados):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
 
 
-def main():
-    """Función principal: abre la cámara y corre el bucle de detección."""
+def leer_opciones_de_consola():
+    """Lee las opciones que se pasan al ejecutar el programa desde la consola.
+
+    Gracias a esto podés cambiar de modo sin editar el archivo. Por ejemplo:
+
+        python detector_somnoliencia.py --modo simulador
+        python detector_somnoliencia.py --modo desactivado
+        python detector_somnoliencia.py --modo ble --nombre-ble MiSensor
+
+    Si no pasás ninguna opción, se usan los valores por defecto definidos
+    arriba en las CONSTANTES DE CONFIGURACIÓN."""
+    analizador = argparse.ArgumentParser(
+        description="Detector de somnolencia: ojos cerrados (camara) y cabezazos (acelerometro)."
+    )
+    analizador.add_argument(
+        "--modo",
+        default=MODO_SENSOR,
+        choices=["simulador", "clasico", "ble", "desactivado"],
+        help="De donde salen los datos del acelerometro. Por defecto: %(default)s",
+    )
+    analizador.add_argument(
+        "--puerto",
+        default=PUERTO_COM,
+        help="Puerto COM del modulo Bluetooth Clasico. Por defecto: %(default)s",
+    )
+    analizador.add_argument(
+        "--nombre-ble",
+        default=NOMBRE_DISPOSITIVO_BLE,
+        help="Nombre del dispositivo BLE. Por defecto: %(default)s",
+    )
+    analizador.add_argument(
+        "--uuid-ble",
+        default=UUID_CARACTERISTICA_BLE,
+        help="UUID de la caracteristica BLE que envia los datos.",
+    )
+    return analizador.parse_args()
+
+
+def main(opciones=None):
+    """Función principal: abre la cámara y corre el bucle de detección.
+
+    'opciones' son las elegidas desde la consola. Si no se pasa ninguna
+    (por ejemplo, si alguien llama a main() desde otro script), se usan
+    los valores por defecto de las constantes."""
+    if opciones is None:
+        opciones = argparse.Namespace(
+            modo=MODO_SENSOR,
+            puerto=PUERTO_COM,
+            nombre_ble=NOMBRE_DISPOSITIVO_BLE,
+            uuid_ble=UUID_CARACTERISTICA_BLE,
+        )
 
     # --- Preparamos el detector facial de MediaPipe ---
     detector_facial = crear_detector_facial()
@@ -448,16 +503,16 @@ def main():
     lector_sensor = None
     detector_cabezazos = sensor.DetectorCabezazos()
 
-    if MODO_SENSOR != "desactivado":
+    if opciones.modo != "desactivado":
         try:
             lector_sensor = sensor.crear_lector(
-                MODO_SENSOR,
-                puerto_com=PUERTO_COM,
-                nombre_ble=NOMBRE_DISPOSITIVO_BLE,
-                uuid_ble=UUID_CARACTERISTICA_BLE,
+                opciones.modo,
+                puerto_com=opciones.puerto,
+                nombre_ble=opciones.nombre_ble,
+                uuid_ble=opciones.uuid_ble,
             )
             lector_sensor.iniciar()
-            print(f"Acelerometro iniciado en modo '{MODO_SENSOR}'.")
+            print(f"Acelerometro iniciado en modo '{opciones.modo}'.")
         except Exception as error:
             print(f"AVISO: no se pudo iniciar el acelerometro ({error}).")
             print("El programa sigue funcionando solo con la camara.")
@@ -505,7 +560,7 @@ def main():
 
     print("Detector de somnolencia iniciado. Presioná 'q' en la ventana de")
     print("video para salir.")
-    if MODO_SENSOR == "simulador":
+    if opciones.modo == "simulador":
         print("Modo simulador: presioná 'c' para simular un cabezazo.")
 
     while True:
@@ -641,4 +696,4 @@ def main():
 # directamente (por ejemplo, con "python detector_somnoliencia.py"), y no si
 # alguna vez este archivo se importa desde otro script de Python.
 if __name__ == "__main__":
-    main()
+    main(leer_opciones_de_consola())
