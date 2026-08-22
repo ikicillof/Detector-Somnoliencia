@@ -1,0 +1,7 @@
+# mediapipe ya instala su propia versión de OpenCV (opencv-contrib-python)
+# como dependencia. No agregamos "opencv-python" por separado porque tener
+# opencv-python Y opencv-contrib-python instalados al mismo tiempo genera
+# conflictos (ambos paquetes proveen el módulo "cv2" y pueden pisarse entre
+# sí, provocando errores difíciles de diagnosticar).
+mediapipe>=0.10,<2.0
+numpy>=1.26
