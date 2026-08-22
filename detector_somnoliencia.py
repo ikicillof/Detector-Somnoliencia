@@ -4,12 +4,28 @@
 #
 # ¿QUÉ HACE ESTE PROGRAMA?
 # ------------------------
-# Usa la webcam para mirar tu cara en tiempo real. Detecta tus ojos y calcula
-# qué tan "abiertos" o "cerrados" están usando una fórmula matemática llamada
-# EAR (Eye Aspect Ratio = "Relación de Aspecto del Ojo"). Si detecta que
-# tuviste los ojos cerrados durante varios cuadros (frames) seguidos —lo cual
-# indica que probablemente te estás quedando dormido y no simplemente
-# parpadeando— dispara una alarma sonora y muestra un aviso en pantalla.
+# Detecta si un conductor se está quedando dormido, vigilando DOS SEÑALES
+# distintas al mismo tiempo:
+#
+# 1) LOS OJOS (con la webcam, en este archivo). Usa la cámara para mirar tu
+#    cara en tiempo real, detecta tus ojos y calcula qué tan "abiertos" o
+#    "cerrados" están usando una fórmula matemática llamada EAR (Eye Aspect
+#    Ratio = "Relación de Aspecto del Ojo"). Si tuviste los ojos cerrados
+#    durante varios cuadros (frames) seguidos —lo cual indica que
+#    probablemente te estás quedando dormido y no simplemente parpadeando—
+#    dispara la alarma.
+#
+# 2) LOS CABEZAZOS (con un acelerómetro por Bluetooth, en el archivo
+#    sensor_acelerometro.py). Un acelerómetro colocado en la cabeza mide los
+#    movimientos bruscos característicos de alguien que da un cabezazo y se
+#    despierta de golpe. Si ocurren dos o más de esos movimientos en menos de
+#    20 segundos, también dispara la alarma.
+#
+# Las dos señales son independientes: cada una puede disparar la alerta por
+# su cuenta, y ambas comparten el mismo pitido de alarma y un cartel rojo en
+# pantalla. Que sean independientes es importante, porque se complementan: la
+# cámara falla si hay poca luz o el conductor usa anteojos oscuros, y el
+# acelerómetro no sirve si el conductor se duerme sin mover la cabeza.
 #
 # ¿QUÉ ES "MEDIAPIPE FACE LANDMARKER"?
 # -------------------------------------
@@ -68,6 +84,8 @@
 # ==============================================================================
 
 # --- Librerías de la biblioteca estándar de Python (ya vienen instaladas) ---
+import argparse  # Para poder elegir opciones al ejecutar desde la consola,
+                 # sin tener que editar el archivo cada vez.
 import os
 import sys
 import time
@@ -87,6 +105,11 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 import numpy as np    # NumPy: lo usamos para calcular distancias entre puntos
                        # de forma simple y rápida.
+
+# --- Módulo propio de este proyecto ---
+# Se ocupa de leer el acelerómetro por Bluetooth y de detectar los cabezazos.
+# Está en el archivo sensor_acelerometro.py, al lado de este.
+import sensor_acelerometro as sensor
 
 
 # ==============================================================================
@@ -130,6 +153,40 @@ ALARM_DURATION_MS = 700
 # de MediaPipe, y nombre con el que se guarda en la carpeta del proyecto.
 MODELO_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
 MODELO_NOMBRE_ARCHIVO = "face_landmarker.task"
+
+# --- Configuración del acelerómetro (detección de cabezazos) ---
+# De dónde salen los datos del acelerómetro. Las opciones son:
+#   "simulador"   -> datos falsos generados por el programa. No necesita
+#                    hardware: sirve para probar que todo funciona. En este
+#                    modo podés apretar la tecla 'c' para simular un cabezazo.
+#   "clasico"     -> Bluetooth Clásico (módulos HC-05 / HC-06 con Arduino).
+#                    Requiere instalar pyserial y configurar PUERTO_COM.
+#   "ble"         -> Bluetooth Low Energy (ESP32 y sensores modernos).
+#                    Requiere instalar bleak y configurar los datos de abajo.
+#   "desactivado" -> ignora el acelerómetro por completo y usa solo la cámara.
+#
+# Este es el valor POR DEFECTO. También se puede elegir al ejecutar el
+# programa desde la consola, sin tocar el archivo, así:
+#     python detector_somnoliencia.py --modo desactivado
+MODO_SENSOR = "simulador"
+
+# Solo se usa si MODO_SENSOR es "clasico". Es el puerto COM que Windows le
+# asignó al módulo Bluetooth al emparejarlo (mirar en el Administrador de
+# dispositivos, bajo "Puertos (COM y LPT)").
+PUERTO_COM = "COM5"
+
+# Solo se usan si MODO_SENSOR es "ble": el nombre con el que el sensor se
+# anuncia por Bluetooth, y el UUID de la característica que manda los datos.
+# Ambos los define el firmware del sensor.
+NOMBRE_DISPOSITIVO_BLE = "AcelerometroCasco"
+UUID_CARACTERISTICA_BLE = "0000ffe1-0000-1000-8000-00805f9b34fb"
+
+# Cuántos segundos queda visible en pantalla el cartel de alerta por
+# cabezazos. A diferencia de la alerta por ojos cerrados (que se mantiene
+# sola mientras los ojos sigan cerrados), un cabezazo es un evento
+# instantáneo: si no lo dejáramos fijo un rato, el cartel aparecería y
+# desaparecería tan rápido que no llegarías a leerlo.
+DURACION_ALERTA_CABEZAZOS_SEG = 5.0
 
 # --- Índices de los puntos de MediaPipe que forman cada ojo ---
 # MediaPipe numera sus puntos de la cara siempre en el mismo orden. Estos son los
@@ -318,6 +375,56 @@ def dibujar_alerta(frame):
     )
 
 
+def dibujar_alerta_cabezazos(frame):
+    """Dibuja el aviso visual de alerta por cabezazos detectados.
+
+    Se dibuja más abajo que la alerta por ojos cerrados para que, si las dos
+    saltan al mismo tiempo, no se pisen y se puedan leer ambas."""
+    alto_frame, ancho_frame = frame.shape[:2]
+    texto = "ALERTA! CABEZAZOS DETECTADOS"
+
+    cv2.rectangle(frame, (0, 60), (ancho_frame, 115), (0, 0, 255), -1)
+    cv2.putText(
+        frame, texto, (10, 98),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA
+    )
+
+
+def disparar_alarma_si_corresponde(hilo_alarma):
+    """Lanza el pitido de alarma en un hilo nuevo, si no hay uno sonando ya.
+
+    Devuelve el hilo (nuevo o el que ya estaba) para que quien la llama lo
+    siga teniendo a mano. Esta función la usan TANTO la alerta por ojos
+    cerrados COMO la alerta por cabezazos: ambas comparten la misma alarma,
+    y este guard compartido evita que se pisen entre sí si las dos se
+    disparan casi al mismo tiempo."""
+    if hilo_alarma is None or not hilo_alarma.is_alive():
+        hilo_alarma = threading.Thread(target=reproducir_alarma, daemon=True)
+        # 'daemon=True' significa que este hilo no va a impedir que el
+        # programa se cierre si vos apretás 'q': Python lo corta junto con
+        # todo lo demás al salir.
+        hilo_alarma.start()
+    return hilo_alarma
+
+
+def dibujar_info_sensor(frame, detector_cabezazos, sensor_conectado):
+    """Muestra en pantalla el estado del acelerómetro.
+
+    Igual que la info de EAR, esto no hace falta para que la alarma
+    funcione: sirve para ver en vivo qué está midiendo el sensor y poder
+    ajustar el umbral con números reales delante."""
+    if not sensor_conectado:
+        cv2.putText(frame, "Acelerometro: SIN SENAL", (10, frame.shape[0] - 65),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+        return
+
+    texto = (f"Cabezazos: {detector_cabezazos.cantidad_eventos_recientes()}"
+             f"/{sensor.MIN_CABEZAZOS_PARA_ALERTA}"
+             f"  (mov: {detector_cabezazos.ultima_desviacion:.1f})")
+    cv2.putText(frame, texto, (10, frame.shape[0] - 65),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+
+
 def dibujar_info_debug(frame, ear_promedio, frames_ojos_cerrados):
     """Dibuja en pantalla el valor actual de EAR y el contador de frames.
 
@@ -333,11 +440,83 @@ def dibujar_info_debug(frame, ear_promedio, frames_ojos_cerrados):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
 
 
-def main():
-    """Función principal: abre la cámara y corre el bucle de detección."""
+def leer_opciones_de_consola():
+    """Lee las opciones que se pasan al ejecutar el programa desde la consola.
+
+    Gracias a esto podés cambiar de modo sin editar el archivo. Por ejemplo:
+
+        python detector_somnoliencia.py --modo simulador
+        python detector_somnoliencia.py --modo desactivado
+        python detector_somnoliencia.py --modo ble --nombre-ble MiSensor
+
+    Si no pasás ninguna opción, se usan los valores por defecto definidos
+    arriba en las CONSTANTES DE CONFIGURACIÓN."""
+    analizador = argparse.ArgumentParser(
+        description="Detector de somnolencia: ojos cerrados (camara) y cabezazos (acelerometro)."
+    )
+    analizador.add_argument(
+        "--modo",
+        default=MODO_SENSOR,
+        choices=["simulador", "clasico", "ble", "desactivado"],
+        help="De donde salen los datos del acelerometro. Por defecto: %(default)s",
+    )
+    analizador.add_argument(
+        "--puerto",
+        default=PUERTO_COM,
+        help="Puerto COM del modulo Bluetooth Clasico. Por defecto: %(default)s",
+    )
+    analizador.add_argument(
+        "--nombre-ble",
+        default=NOMBRE_DISPOSITIVO_BLE,
+        help="Nombre del dispositivo BLE. Por defecto: %(default)s",
+    )
+    analizador.add_argument(
+        "--uuid-ble",
+        default=UUID_CARACTERISTICA_BLE,
+        help="UUID de la caracteristica BLE que envia los datos.",
+    )
+    return analizador.parse_args()
+
+
+def main(opciones=None):
+    """Función principal: abre la cámara y corre el bucle de detección.
+
+    'opciones' son las elegidas desde la consola. Si no se pasa ninguna
+    (por ejemplo, si alguien llama a main() desde otro script), se usan
+    los valores por defecto de las constantes."""
+    if opciones is None:
+        opciones = argparse.Namespace(
+            modo=MODO_SENSOR,
+            puerto=PUERTO_COM,
+            nombre_ble=NOMBRE_DISPOSITIVO_BLE,
+            uuid_ble=UUID_CARACTERISTICA_BLE,
+        )
 
     # --- Preparamos el detector facial de MediaPipe ---
     detector_facial = crear_detector_facial()
+
+    # --- Preparamos el acelerómetro (detección de cabezazos) ---
+    # Si algo falla al conectar con el sensor (Bluetooth apagado, puerto COM
+    # equivocado, librería sin instalar), NO cortamos el programa: avisamos y
+    # seguimos funcionando solo con la cámara. La idea es que un problema con
+    # el sensor no te deje sin la detección por ojos, que es la principal.
+    lector_sensor = None
+    detector_cabezazos = sensor.DetectorCabezazos()
+
+    if opciones.modo != "desactivado":
+        try:
+            lector_sensor = sensor.crear_lector(
+                opciones.modo,
+                puerto_com=opciones.puerto,
+                nombre_ble=opciones.nombre_ble,
+                uuid_ble=opciones.uuid_ble,
+            )
+            lector_sensor.iniciar()
+            print(f"Acelerometro iniciado en modo '{opciones.modo}'.")
+        except Exception as error:
+            print(f"AVISO: no se pudo iniciar el acelerometro ({error}).")
+            print("El programa sigue funcionando solo con la camara.")
+            lector_sensor = None
 
     # --- Abrimos la webcam ---
     # El '0' significa "la primera cámara disponible en la computadora".
@@ -370,8 +549,19 @@ def main():
     # 'procesar_frame'), así que simplemente le sumamos 1 en cada vuelta.
     contador_timestamp_ms = 0
 
+    # Momento (según el reloj de la computadora) en que se disparó la última
+    # alerta por cabezazos. Sirve para mantener el cartel visible unos
+    # segundos. Vale None mientras no haya habido ninguna alerta.
+    momento_alerta_cabezazos = None
+
+    # Momento en que llegó la última muestra del acelerómetro, para poder
+    # avisar si el sensor se queda sin señal.
+    momento_ultima_muestra = time.monotonic()
+
     print("Detector de somnolencia iniciado. Presioná 'q' en la ventana de")
     print("video para salir.")
+    if opciones.modo == "simulador":
+        print("Modo simulador: presioná 'c' para simular un cabezazo.")
 
     while True:
         # Leemos un frame (una imagen) de la cámara.
@@ -422,29 +612,71 @@ def main():
             if somnoliento:
                 dibujar_alerta(frame)
 
-                # Lanzamos el pitido en un hilo nuevo SOLO si no hay ya un
-                # pitido sonando en este momento (hilo_alarma is None, o el
-                # hilo anterior ya terminó de sonar). Esto evita que, si los
-                # ojos siguen cerrados durante varios segundos, se disparen
-                # decenas de pitidos superpuestos por segundo: en cambio,
-                # se va reproduciendo un pitido, y apenas termina, si seguís
-                # con los ojos cerrados, arranca el siguiente.
-                if hilo_alarma is None or not hilo_alarma.is_alive():
-                    hilo_alarma = threading.Thread(target=reproducir_alarma, daemon=True)
-                    # 'daemon=True' significa que este hilo no va a impedir
-                    # que el programa se cierre si vos apretás 'q': Python
-                    # lo corta junto con todo lo demás al salir.
-                    hilo_alarma.start()
+                # Lanzamos el pitido solo si no hay ya uno sonando. Esto
+                # evita que, si los ojos siguen cerrados durante varios
+                # segundos, se disparen decenas de pitidos superpuestos por
+                # segundo: en cambio, se va reproduciendo un pitido, y apenas
+                # termina, si seguís con los ojos cerrados, arranca el
+                # siguiente.
+                hilo_alarma = disparar_alarma_si_corresponde(hilo_alarma)
+
+        # ==================================================================
+        # PARTE 2: EL ACELERÓMETRO (DETECCIÓN DE CABEZAZOS)
+        # ==================================================================
+        # Esta parte es independiente de la de la cámara: aunque no se
+        # detecte ninguna cara, los cabezazos se siguen midiendo.
+        if lector_sensor is not None:
+            # Levantamos todas las muestras que hayan llegado por Bluetooth
+            # desde la vuelta anterior del bucle. Esta llamada NO espera: si
+            # todavía no llegó nada, devuelve una lista vacía y seguimos de
+            # largo, así el video nunca se frena esperando al sensor.
+            muestras = lector_sensor.leer_muestras()
+
+            if muestras:
+                momento_ultima_muestra = time.monotonic()
+
+            for muestra in muestras:
+                if detector_cabezazos.procesar_muestra(muestra):
+                    # Se juntaron los cabezazos suficientes dentro de la
+                    # ventana de tiempo: alerta.
+                    print("ALERTA: se detectaron cabezazos / movimientos bruscos.")
+                    momento_alerta_cabezazos = time.monotonic()
+                    hilo_alarma = disparar_alarma_si_corresponde(hilo_alarma)
+
+            # ¿Hace cuánto que no llega ninguna muestra? Si pasó demasiado
+            # tiempo, damos el sensor por desconectado.
+            sensor_conectado = (
+                (time.monotonic() - momento_ultima_muestra) < sensor.TIMEOUT_SENSOR_SEG
+            )
+            dibujar_info_sensor(frame, detector_cabezazos, sensor_conectado)
+
+            # Mantenemos el cartel de alerta en pantalla unos segundos
+            # después del evento, para que dé tiempo a leerlo.
+            if momento_alerta_cabezazos is not None:
+                transcurrido = time.monotonic() - momento_alerta_cabezazos
+                if transcurrido < DURACION_ALERTA_CABEZAZOS_SEG:
+                    dibujar_alerta_cabezazos(frame)
+                else:
+                    momento_alerta_cabezazos = None
 
         # Mostramos el frame resultante en una ventana.
         cv2.imshow("Detector de Somnolencia", frame)
 
-        # Esperamos 1 milisegundo a que se presione una tecla. Si la tecla
-        # presionada es 'q', salimos del bucle. El '& 0xFF' es una forma
-        # estándar de comparar la tecla en distintos sistemas operativos.
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        # Esperamos 1 milisegundo a que se presione una tecla. El '& 0xFF' es
+        # una forma estándar de comparar la tecla en distintos sistemas
+        # operativos.
+        tecla = cv2.waitKey(1) & 0xFF
+
+        if tecla == ord('q'):
             print("Saliendo del programa...")
             break
+
+        # En modo simulador, la tecla 'c' genera un cabezazo falso. Sirve
+        # para probar la alerta sin tener el sensor real: apretala dos veces
+        # con menos de 20 segundos de diferencia y debería saltar la alarma.
+        if tecla == ord('c') and isinstance(lector_sensor, sensor.LectorSimulado):
+            lector_sensor.forzar_cabezazo()
+            print("Cabezazo simulado.")
 
     # --- Liberamos los recursos antes de terminar ---
     # Muy importante: si no liberamos la cámara, puede quedar "ocupada" y
@@ -454,9 +686,14 @@ def main():
     cv2.destroyAllWindows()
     detector_facial.close()
 
+    # También cerramos la conexión con el acelerómetro, para liberar el
+    # puerto Bluetooth y que quede disponible para la próxima ejecución.
+    if lector_sensor is not None:
+        lector_sensor.detener()
+
 
 # Este bloque hace que 'main()' se ejecute solo cuando corrés este archivo
 # directamente (por ejemplo, con "python detector_somnoliencia.py"), y no si
 # alguna vez este archivo se importa desde otro script de Python.
 if __name__ == "__main__":
-    main()
+    main(leer_opciones_de_consola())
