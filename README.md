@@ -1,13 +1,22 @@
 # Detector de Somnolencia
 
-Programa en Python que usa la webcam para detectar en tiempo real si el
-conductor tiene los ojos cerrados durante varios segundos seguidos, y en ese
-caso dispara una alerta visual en pantalla y una alarma sonora.
+Programa en Python que detecta la somnolencia de un conductor en tiempo real,
+usando **dos señales independientes**:
 
-Funciona midiendo el **EAR (Eye Aspect Ratio)** de ambos ojos a partir de los
-puntos faciales que detecta **MediaPipe Face Landmarker**. El código está en
-`detector_somnoliencia.py` y tiene comentarios muy detallados pensados para
-alguien sin experiencia previa en Python, visión por computadora o IA.
+1. **Ojos cerrados (cámara)**: mide el **EAR (Eye Aspect Ratio)** de ambos ojos
+   a partir de los puntos faciales que detecta **MediaPipe Face Landmarker**.
+   Si los ojos permanecen cerrados unos 2 segundos seguidos, alerta.
+2. **Cabezazos (acelerómetro por Bluetooth)**: detecta movimientos bruscos de
+   la cabeza. Si ocurren **2 o más cabezazos en menos de 20 segundos**, alerta.
+
+Ambas disparan la misma alarma sonora y un cartel rojo en pantalla.
+
+El código está repartido en dos archivos, ambos con comentarios muy detallados
+pensados para alguien sin experiencia previa en Python, visión por computadora
+o IA:
+
+- `detector_somnoliencia.py` — programa principal y detección por cámara.
+- `sensor_acelerometro.py` — lectura del acelerómetro y detección de cabezazos.
 
 > La primera vez que lo ejecutes, el programa descarga automáticamente el
 > modelo de detección facial de MediaPipe (`face_landmarker.task`, ~4 MB) y
@@ -45,10 +54,78 @@ python detector_somnoliencia.py
 ## Controles
 
 - Se abre una ventana mostrando la imagen de la cámara con los puntos de los
-  ojos marcados, el valor de EAR en vivo y el contador de frames con ojos
-  cerrados.
+  ojos marcados, el valor de EAR en vivo, el contador de frames con ojos
+  cerrados y el estado del acelerómetro.
 - Presioná **`q`** con la ventana enfocada para cerrar el programa
   correctamente.
+- Presioná **`c`** para simular un cabezazo (solo en modo simulador).
+
+## Acelerómetro: detección de cabezazos
+
+El acelerómetro se coloca en la cabeza (vincha, gorra o auricular) y envía
+datos por Bluetooth. El programa detecta movimientos bruscos y alerta cuando
+ocurren **2 o más en menos de 20 segundos**.
+
+### Elegir el modo
+
+En `detector_somnoliencia.py`, la constante `MODO_SENSOR` define de dónde
+salen los datos:
+
+| Modo | Para qué sirve | Requiere |
+|---|---|---|
+| `"simulador"` | Probar sin hardware. Tecla `c` genera un cabezazo. | Nada |
+| `"clasico"` | Bluetooth Clásico (HC-05 / HC-06 con Arduino) | `pip install pyserial` |
+| `"ble"` | Bluetooth Low Energy (ESP32 y similares) | `pip install bleak` |
+| `"desactivado"` | Usar solo la cámara | Nada |
+
+Viene configurado en `"simulador"` porque el hardware todavía no está
+definido. Si el sensor falla al conectar, el programa **no se cae**: avisa por
+consola y sigue funcionando solo con la cámara.
+
+### Formato de datos que debe enviar el sensor
+
+Cada muestra es **una línea de texto** terminada en salto de línea:
+
+```
+t_ms,ax,ay,az
+```
+
+- `t_ms`: entero, milisegundos desde que arrancó el microcontrolador
+  (en Arduino/ESP32 es directamente `millis()`).
+- `ax,ay,az`: decimales, aceleración de cada eje en m/s².
+
+Ejemplo de código para el lado del sensor (Arduino / ESP32):
+
+```cpp
+Serial.print(millis());   Serial.print(",");
+Serial.print(ax, 2);      Serial.print(",");
+Serial.print(ay, 2);      Serial.print(",");
+Serial.println(az, 2);
+```
+
+> **Por qué el sensor debe mandar su propia marca de tiempo:** el Bluetooth
+> introduce un retraso pequeño pero variable (*jitter*). Si midiéramos los 20
+> segundos con la hora de llegada a la computadora, ese jitter ensuciaría la
+> medición. Usando el tiempo del propio microcontrolador, la distancia entre
+> dos cabezazos se mide tal como ocurrió en la cabeza del conductor, sin
+> importar cuánto tarden los datos en llegar.
+>
+> El programa igual acepta líneas de solo `ax,ay,az` (sin marca de tiempo),
+> usando la hora de llegada como respaldo, con algo menos de precisión.
+
+### Ajustar la detección de cabezazos
+
+Los parámetros están al principio de `sensor_acelerometro.py`:
+
+- `UMBRAL_MOVIMIENTO_BRUSCO` (por defecto `3.5` m/s²): cuánto tiene que
+  apartarse la aceleración de su valor de reposo para contar como cabezazo.
+  Si detecta cabezazos que no existen, subilo; si no detecta los reales,
+  bajalo. Como referencia, la gravedad es 9.81 m/s².
+- `VENTANA_CABEZAZOS_SEG` (por defecto `20.0`): la ventana de tiempo.
+- `MIN_CABEZAZOS_PARA_ALERTA` (por defecto `2`): cuántos disparan la alerta.
+- `TIEMPO_REFRACTARIO_SEG` (por defecto `0.4`): después de contar un
+  cabezazo, cuánto tiempo se ignora el sensor para no contar el mismo
+  sacudón muchas veces.
 
 ## Ajustar la sensibilidad
 
@@ -84,3 +161,9 @@ Todos los parámetros configurables están al principio de
   ejecutar el programa. También podés descargar el archivo manualmente desde
   la URL que figura en la constante `MODELO_URL` del script y guardarlo en
   esta carpeta con el nombre `face_landmarker.task`.
+- **"AVISO: no se pudo iniciar el acelerometro"**: el programa sigue andando
+  solo con la cámara. Revisá que la librería correspondiente esté instalada
+  (`pyserial` o `bleak`), que el sensor esté encendido y emparejado, y que
+  el `PUERTO_COM` o el nombre BLE configurados sean los correctos.
+- **"Acelerometro: SIN SENAL" en pantalla**: la conexión se abrió pero dejaron
+  de llegar datos. Suele ser el sensor apagado, sin batería o fuera de rango.
