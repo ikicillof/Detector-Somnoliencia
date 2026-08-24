@@ -106,10 +106,11 @@ from mediapipe.tasks.python import vision as mp_vision
 import numpy as np    # NumPy: lo usamos para calcular distancias entre puntos
                        # de forma simple y rápida.
 
-# --- Módulo propio de este proyecto ---
-# Se ocupa de leer el acelerómetro por Bluetooth y de detectar los cabezazos.
-# Está en el archivo sensor_acelerometro.py, al lado de este.
-import sensor_acelerometro as sensor
+# --- Módulos propios de este proyecto ---
+# Se ocupan de leer, cada uno, su sensor por Bluetooth y de detectar su señal
+# de somnolencia. Están en archivos al lado de este.
+import sensor_acelerometro as sensor  # cabezazos (acelerómetro)
+import sensor_pulso as pulso          # caídas de frecuencia cardíaca (BPM)
 
 
 # ==============================================================================
@@ -187,6 +188,35 @@ UUID_CARACTERISTICA_BLE = "0000ffe1-0000-1000-8000-00805f9b34fb"
 # instantáneo: si no lo dejáramos fijo un rato, el cartel aparecería y
 # desaparecería tan rápido que no llegarías a leerlo.
 DURACION_ALERTA_CABEZAZOS_SEG = 5.0
+
+# --- Configuración del sensor de pulso (frecuencia cardíaca / BPM) ---
+# De dónde salen los datos de BPM. Las opciones son:
+#   "simulador"   -> BPM falso generado por el programa. No necesita
+#                    hardware: en este modo podés forzar una caída llamando
+#                    a lector_pulso.forzar_caida() (ver sensor_pulso.py).
+#   "ble"         -> Bluetooth Low Energy, sensor con Heart Rate Service
+#                    estándar (por ejemplo, un Polar H10 o un Wahoo TICKR).
+#   "desactivado" -> ignora el sensor de pulso por completo.
+MODO_SENSOR_PULSO = "simulador"
+
+# Nombre anunciado por BLE del sensor de pulso. Solo se usa si no se indica
+# DIRECCION_BLE_PULSO (ver abajo).
+NOMBRE_BLE_PULSO = "Polar H10"
+
+# Dirección MAC del sensor de pulso (ej. "AA:BB:CC:DD:EE:FF"). Es OPCIONAL,
+# pero conectar por MAC es más rápido y más confiable para la reconexión
+# automática que buscar por nombre. Si es None, se busca por nombre.
+DIRECCION_BLE_PULSO = None
+
+# IMPORTANTE: la caída de BPM, por sí sola, NO dispara la alarma (el pulso
+# es una señal más débil y más lenta que los ojos cerrados o un cabezazo).
+# Solo cuenta como confirmación cuando se combina con OTRA señal (ojos
+# cerrados o cabezazos) que esté activa dentro de esta misma ventana de
+# tiempo. Este valor es cuánto tiempo (en segundos) después de confirmarse
+# una caída de BPM seguimos considerándola "vigente" para poder combinarla
+# con una señal de cámara o acelerómetro que aparezca poco después (o que ya
+# estuviera activa).
+DURACION_VENTANA_COMBINACION_PULSO_SEG = 10.0
 
 # --- Índices de los puntos de MediaPipe que forman cada ojo ---
 # MediaPipe numera sus puntos de la cara siempre en el mismo orden. Estos son los
@@ -390,6 +420,22 @@ def dibujar_alerta_cabezazos(frame):
     )
 
 
+def dibujar_alerta_pulso_combinada(frame):
+    """Dibuja el aviso visual de alerta combinada: caída de BPM confirmada
+    junto con otra señal (ojos cerrados o cabezazos) ya activa.
+
+    Se dibuja más abajo que las otras dos alertas, en su propia franja, para
+    que las tres puedan verse a la vez si llegaran a coincidir."""
+    alto_frame, ancho_frame = frame.shape[:2]
+    texto = "ALERTA! CAIDA DE PULSO + OTRA SENAL"
+
+    cv2.rectangle(frame, (0, 115), (ancho_frame, 170), (0, 0, 255), -1)
+    cv2.putText(
+        frame, texto, (10, 153),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA
+    )
+
+
 def disparar_alarma_si_corresponde(hilo_alarma):
     """Lanza el pitido de alarma en un hilo nuevo, si no hay uno sonando ya.
 
@@ -422,6 +468,20 @@ def dibujar_info_sensor(frame, detector_cabezazos, sensor_conectado):
              f"/{sensor.MIN_CABEZAZOS_PARA_ALERTA}"
              f"  (mov: {detector_cabezazos.ultima_desviacion:.1f})")
     cv2.putText(frame, texto, (10, frame.shape[0] - 65),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+
+
+def dibujar_info_pulso(frame, detector_bpm, sensor_conectado):
+    """Muestra en pantalla el estado del sensor de pulso: el último BPM
+    válido leído, o un aviso si no hay señal (desconectado o sin buen
+    contacto con la piel)."""
+    if not sensor_conectado or not detector_bpm.hay_senal_valida():
+        cv2.putText(frame, "Pulso: SIN SENAL", (10, frame.shape[0] - 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+        return
+
+    texto = f"Pulso: {detector_bpm.ultimo_bpm_valido} BPM"
+    cv2.putText(frame, texto, (10, frame.shape[0] - 90),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
 
 
@@ -475,6 +535,22 @@ def leer_opciones_de_consola():
         default=UUID_CARACTERISTICA_BLE,
         help="UUID de la caracteristica BLE que envia los datos.",
     )
+    analizador.add_argument(
+        "--modo-pulso",
+        default=MODO_SENSOR_PULSO,
+        choices=["simulador", "ble", "desactivado"],
+        help="De donde salen los datos de pulso (BPM). Por defecto: %(default)s",
+    )
+    analizador.add_argument(
+        "--nombre-ble-pulso",
+        default=NOMBRE_BLE_PULSO,
+        help="Nombre del sensor de pulso BLE. Por defecto: %(default)s",
+    )
+    analizador.add_argument(
+        "--direccion-ble-pulso",
+        default=DIRECCION_BLE_PULSO,
+        help="Direccion MAC del sensor de pulso BLE (opcional, mas confiable que el nombre).",
+    )
     return analizador.parse_args()
 
 
@@ -490,6 +566,9 @@ def main(opciones=None):
             puerto=PUERTO_COM,
             nombre_ble=NOMBRE_DISPOSITIVO_BLE,
             uuid_ble=UUID_CARACTERISTICA_BLE,
+            modo_pulso=MODO_SENSOR_PULSO,
+            nombre_ble_pulso=NOMBRE_BLE_PULSO,
+            direccion_ble_pulso=DIRECCION_BLE_PULSO,
         )
 
     # --- Preparamos el detector facial de MediaPipe ---
@@ -517,6 +596,26 @@ def main(opciones=None):
             print(f"AVISO: no se pudo iniciar el acelerometro ({error}).")
             print("El programa sigue funcionando solo con la camara.")
             lector_sensor = None
+
+    # --- Preparamos el sensor de pulso (BPM) ---
+    # Mismo criterio que con el acelerómetro: si falla la conexión, no
+    # cortamos el programa, seguimos con las señales que sí estén disponibles.
+    lector_pulso = None
+    detector_bpm = pulso.DetectorAnomaliaBPM()
+
+    if opciones.modo_pulso != "desactivado":
+        try:
+            lector_pulso = pulso.crear_lector(
+                opciones.modo_pulso,
+                nombre_ble=opciones.nombre_ble_pulso,
+                direccion_ble=opciones.direccion_ble_pulso,
+            )
+            lector_pulso.iniciar()
+            print(f"Sensor de pulso iniciado en modo '{opciones.modo_pulso}'.")
+        except Exception as error:
+            print(f"AVISO: no se pudo iniciar el sensor de pulso ({error}).")
+            print("El programa sigue funcionando sin esa señal.")
+            lector_pulso = None
 
     # --- Abrimos la webcam ---
     # El '0' significa "la primera cámara disponible en la computadora".
@@ -558,10 +657,27 @@ def main(opciones=None):
     # avisar si el sensor se queda sin señal.
     momento_ultima_muestra = time.monotonic()
 
+    # Lo mismo que arriba, pero para el sensor de pulso.
+    momento_ultima_muestra_pulso = time.monotonic()
+
+    # Momento en que se confirmó la última caída sostenida de BPM (o None si
+    # no hay ninguna vigente). Se usa solo para la REGLA DE COMBINACIÓN: ver
+    # comentario junto a DURACION_VENTANA_COMBINACION_PULSO_SEG.
+    momento_alerta_bpm = None
+
+    # Para no imprimir el mismo aviso de alerta combinada en cada vuelta del
+    # bucle mientras siga activa: solo avisamos por consola en el instante en
+    # que pasa de "no activa" a "activa" (el cartel en pantalla, en cambio,
+    # sí se puede seguir dibujando todos los frames sin problema).
+    alerta_combinada_bpm_activa = False
+
     print("Detector de somnolencia iniciado. Presioná 'q' en la ventana de")
     print("video para salir.")
     if opciones.modo == "simulador":
         print("Modo simulador: presioná 'c' para simular un cabezazo.")
+    if opciones.modo_pulso == "simulador":
+        print("Modo simulador de pulso: presioná 'b' para bajar el pulso")
+        print("(y mantenerlo bajo) y 'n' para devolverlo a la normalidad.")
 
     while True:
         # Leemos un frame (una imagen) de la cámara.
@@ -581,6 +697,11 @@ def main(opciones=None):
         ear_promedio, puntos_ojo_izq, puntos_ojo_der = procesar_frame(
             frame, detector_facial, contador_timestamp_ms
         )
+
+        # Se recalcula en cada vuelta del bucle: True solo si, EN ESTE FRAME,
+        # la racha de ojos cerrados ya llegó al umbral. La usa también la
+        # regla de combinación con el sensor de pulso, más abajo.
+        somnoliento = False
 
         if ear_promedio is None:
             # No se detectó ninguna cara en este frame. Reiniciamos el
@@ -659,6 +780,55 @@ def main(opciones=None):
                 else:
                     momento_alerta_cabezazos = None
 
+        # ==================================================================
+        # PARTE 3: EL SENSOR DE PULSO (CAÍDA DE BPM)
+        # ==================================================================
+        # También independiente de la cámara y del acelerómetro: se sigue
+        # midiendo el pulso aunque no haya rostro en cuadro o no haya habido
+        # ningún cabezazo.
+        if lector_pulso is not None:
+            muestras_pulso = lector_pulso.leer_muestras()
+
+            if muestras_pulso:
+                momento_ultima_muestra_pulso = time.monotonic()
+
+            for muestra in muestras_pulso:
+                if detector_bpm.procesar_muestra(muestra):
+                    # Caída de BPM sostenida confirmada. OJO: esto todavía NO
+                    # es una alerta por sí sola (ver comentario en
+                    # DURACION_VENTANA_COMBINACION_PULSO_SEG): solo queda
+                    # "vigente" por un rato para poder combinarse con la
+                    # cámara o el acelerómetro.
+                    print("SEÑAL: caída sostenida de BPM (posible somnolencia).")
+                    momento_alerta_bpm = time.monotonic()
+
+            pulso_conectado = (
+                (time.monotonic() - momento_ultima_muestra_pulso) < pulso.TIMEOUT_SENSOR_SEG
+            )
+            dibujar_info_pulso(frame, detector_bpm, pulso_conectado)
+
+            # --- Regla de combinación ---
+            # La caída de BPM, sola, no dispara la alarma. Solo cuenta cuando
+            # todavía está "vigente" (dentro de su ventana de combinación) Y,
+            # al mismo tiempo, hay otra señal activa: ojos cerrados AHORA
+            # MISMO, o un cabezazo cuyo cartel siga en pantalla. Como esta
+            # comprobación se repite en cada vuelta del bucle, funciona sin
+            # importar cuál de las dos señales haya aparecido primero.
+            pulso_vigente = (
+                momento_alerta_bpm is not None
+                and (time.monotonic() - momento_alerta_bpm) < DURACION_VENTANA_COMBINACION_PULSO_SEG
+            )
+            cabezazos_activo = momento_alerta_cabezazos is not None
+
+            if pulso_vigente and (somnoliento or cabezazos_activo):
+                if not alerta_combinada_bpm_activa:
+                    print("ALERTA: caída de BPM confirmada junto con otra señal de somnolencia.")
+                alerta_combinada_bpm_activa = True
+                dibujar_alerta_pulso_combinada(frame)
+                hilo_alarma = disparar_alarma_si_corresponde(hilo_alarma)
+            else:
+                alerta_combinada_bpm_activa = False
+
         # Mostramos el frame resultante en una ventana.
         cv2.imshow("Detector de Somnolencia", frame)
 
@@ -678,6 +848,17 @@ def main(opciones=None):
             lector_sensor.forzar_cabezazo()
             print("Cabezazo simulado.")
 
+        # En modo simulador de pulso, 'b' baja el BPM simulado y lo mantiene
+        # bajo (para probar la caída sostenida y la alerta combinada sin
+        # tener el sensor real), y 'n' lo devuelve a la normalidad.
+        if tecla == ord('b') and isinstance(lector_pulso, pulso.LectorSimulado):
+            lector_pulso.forzar_caida_manual()
+            print("Pulso bajo simulado (sostenido). Presioná 'n' para volver a la normalidad.")
+
+        if tecla == ord('n') and isinstance(lector_pulso, pulso.LectorSimulado):
+            lector_pulso.restaurar_pulso_normal()
+            print("Pulso simulado vuelto a la normalidad.")
+
     # --- Liberamos los recursos antes de terminar ---
     # Muy importante: si no liberamos la cámara, puede quedar "ocupada" y
     # otras aplicaciones (o el propio programa, si lo volvés a correr) no
@@ -686,10 +867,13 @@ def main(opciones=None):
     cv2.destroyAllWindows()
     detector_facial.close()
 
-    # También cerramos la conexión con el acelerómetro, para liberar el
-    # puerto Bluetooth y que quede disponible para la próxima ejecución.
+    # También cerramos la conexión con el acelerómetro y con el sensor de
+    # pulso, para liberar el Bluetooth y que quede disponible para la
+    # próxima ejecución.
     if lector_sensor is not None:
         lector_sensor.detener()
+    if lector_pulso is not None:
+        lector_pulso.detener()
 
 
 # Este bloque hace que 'main()' se ejecute solo cuando corrés este archivo

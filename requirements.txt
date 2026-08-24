@@ -15,3 +15,8 @@ numpy>=1.26
 #
 #   Bluetooth Low Energy (ESP32 y sensores modernos):
 # bleak>=0.21
+
+# --- Dependencia OPCIONAL del sensor de pulso (BPM) ---
+# Usa la misma libreria 'bleak' de arriba (protocolo BLE estandar Heart
+# Rate Service, UUID 0x180D): si ya la descomentaste para el acelerometro
+# BLE, no hace falta agregar nada mas.
