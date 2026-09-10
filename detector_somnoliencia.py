@@ -4,36 +4,36 @@
 #
 # ¿QUÉ HACE ESTE PROGRAMA?
 # ------------------------
-# Detecta si un conductor se está quedando dormido, vigilando DOS SEÑALES
-# distintas al mismo tiempo:
+# Detecta si un conductor se está quedando dormido mirándolo con la webcam.
+# Toda la información sale de la MISMA malla de puntos faciales que devuelve
+# MediaPipe: no hay ningún sensor externo. Vigila DOS cosas al mismo tiempo:
 #
-# 1) LOS OJOS (con la webcam, en este archivo). Usa la cámara para mirar tu
-#    cara en tiempo real, detecta tus ojos y calcula qué tan "abiertos" o
-#    "cerrados" están usando una fórmula matemática llamada EAR (Eye Aspect
-#    Ratio = "Relación de Aspecto del Ojo"). Si tuviste los ojos cerrados
-#    durante varios cuadros (frames) seguidos —lo cual indica que
-#    probablemente te estás quedando dormido y no simplemente parpadeando—
-#    dispara la alarma.
+# 1) LOS OJOS. Calcula qué tan "abiertos" o "cerrados" están con una fórmula
+#    geométrica llamada EAR (Eye Aspect Ratio). Si los ojos quedan cerrados
+#    varios segundos seguidos —no un simple parpadeo— dispara la alarma.
 #
-# 2) LOS CABEZAZOS (con un acelerómetro por Bluetooth, en el archivo
-#    sensor_acelerometro.py). Un acelerómetro colocado en la cabeza mide los
-#    movimientos bruscos característicos de alguien que da un cabezazo y se
-#    despierta de golpe. Si ocurren dos o más de esos movimientos en menos de
-#    20 segundos, también dispara la alarma.
+# 2) LOS CABECEOS. A partir de los mismos puntos de la cara estima la POSE de
+#    la cabeza (hacia dónde está inclinada) y saca el ángulo de PITCH, que es
+#    la inclinación vertical (cabeza mirando al frente vs. cabeza caída hacia
+#    el pecho). Con ese ángulo detecta dos patrones distintos:
+#      - Cabeza caída sostenida: la cabeza queda inclinada hacia abajo más de
+#        cierto ángulo durante varios segundos.
+#      - Cabeceo brusco: la cabeza cae de golpe y se endereza en menos de un
+#        segundo (el clásico "cabezazo" de quien pega una cabeceada y se
+#        despierta). Se detecta por la VELOCIDAD del movimiento, no por la
+#        posición final.
 #
-# Las dos señales son independientes: cada una puede disparar la alerta por
-# su cuenta, y ambas comparten el mismo pitido de alarma y un cartel rojo en
-# pantalla. Que sean independientes es importante, porque se complementan: la
-# cámara falla si hay poca luz o el conductor usa anteojos oscuros, y el
-# acelerómetro no sirve si el conductor se duerme sin mover la cabeza.
+# Cualquiera de las tres condiciones (ojos cerrados, cabeza caída, cabeceo
+# brusco) dispara la misma alarma: un pitido y un cartel rojo en pantalla.
 #
 # ¿QUÉ ES "MEDIAPIPE FACE LANDMARKER"?
 # -------------------------------------
 # MediaPipe es una librería de Google que, a partir de la imagen de la cámara,
 # nos devuelve unos 478 puntos (coordenadas x, y) distribuidos sobre toda la
 # cara: ojos, cejas, nariz, boca, contorno de la cara, etc. A esta red de
-# puntos se la suele llamar "malla facial". Nosotros solo necesitamos 6 puntos
-# de cada ojo para poder calcular el EAR.
+# puntos se la suele llamar "malla facial". Para el EAR usamos 6 puntos de
+# cada ojo; para la pose de la cabeza usamos 6 puntos más (nariz, mentón,
+# comisuras de ojos y boca).
 #
 # Para poder detectar esos puntos, MediaPipe necesita un archivo con una red
 # neuronal ya entrenada (un "modelo"), llamado `face_landmarker.task`. Este
@@ -71,46 +71,76 @@
 # está cerrado" directamente, medimos una relación geométrica que baja mucho
 # cuando el ojo se cierra.
 #
-# ¿POR QUÉ NO ALCANZA CON UN SOLO CUADRO (FRAME) DE OJOS CERRADOS?
-# -------------------------------------------------------------------
-# Porque parpadear es normal y sano: un parpadeo dura apenas unos 100-400
-# milisegundos. Si disparáramos la alarma apenas viéramos UN frame con EAR
-# bajo, la alarma sonaría todo el tiempo por simples parpadeos, lo cual
-# sería inútil y molesto. Por eso exigimos que el EAR esté por debajo del
-# umbral durante VARIOS FRAMES SEGUIDOS, lo que en la práctica equivale a
-# unos segundos de ojos cerrados de forma sostenida: eso sí es una señal
-# real de somnolencia (o "microsueño"), no un parpadeo normal.
+# ¿QUÉ ES EL PITCH Y CÓMO SE ESTIMA?
+# ------------------------------------
+# La "pose de la cabeza" son los tres ángulos que describen hacia dónde está
+# orientada: yaw (girar a los costados, como decir "no"), pitch (asentir,
+# como decir "sí": cabeza al frente vs. mirando al piso) y roll (ladear la
+# cabeza hacia un hombro). Para la somnolencia solo nos interesa el PITCH.
+#
+# Se estima con cv2.solvePnP: le damos 6 puntos de la cara EN LA IMAGEN (2D)
+# y las mismas 6 posiciones EN UN MODELO 3D GENÉRICO de cabeza humana, y la
+# función calcula qué rotación y traslación de ese modelo 3D explica lo que
+# vemos en la imagen. De esa rotación sacamos el pitch, en grados, tomándolo
+# como la inclinación del eje "arriba de la cara". La intención es que mirar
+# hacia abajo dé pitch NEGATIVO; como el signo de solvePnP puede salir
+# invertido según la cámara, el programa lo verifica y corrige solo,
+# comparándolo con una medida geométrica 2D independiente, apenas el
+# conductor mueve un poco la cabeza.
+#
+# IMPORTANTE: la imagen se muestra espejada (efecto espejo, más cómodo para
+# mirarse), pero el cálculo de la pose se hace sobre el frame SIN espejar,
+# porque una imagen reflejada rompería la geometría de solvePnP.
+#
+# El valor ABSOLUTO del pitch no nos sirve directamente, porque depende de
+# cómo esté puesta la cámara y de la postura natural de cada persona. Por eso,
+# al arrancar, el programa se toma unos segundos para CALIBRAR: promedia el
+# pitch mientras el conductor mira al frente y guarda eso como "posición
+# neutra". De ahí en más todo se mide como DESVIACIÓN respecto de ese neutro.
+# La calibración se valida (si el conductor se movió o no miraba al frente,
+# se reintenta sola), y se puede rehacer en cualquier momento con la tecla
+# 'c'.
+#
+# ¿POR QUÉ TODO SE MIDE EN SEGUNDOS Y NO EN "CUADROS"?
+# -----------------------------------------------------
+# Parpadear es normal y sano: un parpadeo dura apenas 100-400 milisegundos.
+# Si disparáramos la alarma apenas viéramos un instante con los ojos abajo
+# del umbral, sonaría todo el tiempo por simples parpadeos. Por eso exigimos
+# que la condición se mantenga durante VARIOS SEGUNDOS seguidos.
+#
+# Ese "varios segundos" se mide con el reloj (time.time()), NUNCA contando
+# cuántos cuadros seguidos pasaron. La cantidad de cuadros por segundo cambia
+# según la cámara, la luz y la computadora (una Raspberry no procesa al mismo
+# ritmo que una laptop), así que un umbral atado a "cuadros" quedaría mal
+# calibrado apenas cambia algo del entorno. El reloj, en cambio, mide siempre
+# lo mismo.
 #
 # ==============================================================================
 
 # --- Librerías de la biblioteca estándar de Python (ya vienen instaladas) ---
-import argparse  # Para poder elegir opciones al ejecutar desde la consola,
-                 # sin tener que editar el archivo cada vez.
 import os
 import sys
 import time
 import threading
 import urllib.request  # Para descargar el modelo de MediaPipe la primera vez.
 import winsound  # Módulo de Windows para reproducir sonidos simples (pitidos).
-                 # Solo funciona en Windows, pero como este programa está
-                 # pensado para correr desde la consola (cmd) de Windows,
-                 # es la opción más simple: no requiere instalar nada extra
-                 # ni conseguir archivos de sonido.
+                 # NOTA: el reemplazo multiplataforma (numpy + sounddevice) es
+                 # parte de la fase de "sonido multiplataforma", todavía
+                 # pendiente. Por ahora sigue acá como en la versión anterior.
+from collections import deque, namedtuple  # 'deque': cola doble para guardar
+                               # los últimos valores de pitch (suavizado y
+                               # velocidad). 'namedtuple': para devolver la
+                               # pose de la cabeza (pitch, yaw, proxy) junta.
 
 # --- Librerías de terceros (hay que instalarlas con pip, ver requirements.txt) ---
 import cv2            # OpenCV: nos permite acceder a la webcam, mostrar la
-                       # ventana de video y dibujar texto/formas sobre la imagen.
+                       # ventana de video, dibujar sobre la imagen y estimar
+                       # la pose de la cabeza (cv2.solvePnP).
 import mediapipe as mp  # MediaPipe: nos da los puntos de la cara (landmarks).
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
-import numpy as np    # NumPy: lo usamos para calcular distancias entre puntos
-                       # de forma simple y rápida.
-
-# --- Módulos propios de este proyecto ---
-# Se ocupan de leer, cada uno, su sensor por Bluetooth y de detectar su señal
-# de somnolencia. Están en archivos al lado de este.
-import sensor_acelerometro as sensor  # cabezazos (acelerómetro)
-import sensor_pulso as pulso          # caídas de frecuencia cardíaca (BPM)
+import numpy as np    # NumPy: distancias entre puntos, y el ajuste de recta
+                       # con el que medimos la velocidad del cabeceo.
 
 
 # ==============================================================================
@@ -119,109 +149,174 @@ import sensor_pulso as pulso          # caídas de frecuencia cardíaca (BPM)
 # Todos los valores que se pueden "ajustar" del programa están acá arriba,
 # juntos, para que sea fácil experimentar sin tener que buscar en todo el
 # código. Si el programa te resulta muy sensible o muy poco sensible, estos
-# son los números que hay que tocar.
+# son los números que hay que tocar. Para calibrarlos: corré el programa y
+# mirá en pantalla el EAR y el pitch en vivo, con la cabeza y los ojos en
+# distintas posiciones, y ajustá cada número según lo que veas.
 
+# --- Cámara ---
+# Índice de la webcam. 0 es "la primera cámara disponible". Si tenés varias
+# cámaras y agarra la equivocada, probá con 1, 2, etc.
+CAMARA_INDICE = 0
+
+# --- Ojos cerrados (EAR) ---
 # Umbral de EAR: por debajo de este valor consideramos que el ojo está cerrado.
-# 0.22 es un valor típico que funciona bien para la mayoría de las caras, pero
-# puede variar un poco según la persona, el ángulo de la cámara o la
-# iluminación. Si el programa dispara la alarma con los ojos abiertos, bajá
-# este número (por ejemplo a 0.18). Si no detecta cuando cerrás los ojos,
-# subilo (por ejemplo a 0.25).
+# 0.22 es un valor típico, pero varía según la persona, el ángulo de la cámara
+# y la iluminación. Si dispara la alarma con los ojos abiertos, bajalo (p. ej.
+# 0.18). Si no detecta cuando cerrás los ojos, subilo (p. ej. 0.25).
 EAR_THRESHOLD = 0.22
 
-# Umbral de TIEMPO: cuántos segundos seguidos con los ojos "cerrados" (según
-# el EAR) se consideran somnolencia real y no un simple parpadeo.
+# Cuántos SEGUNDOS seguidos con los ojos por debajo del umbral se consideran
+# somnolencia real y no un simple parpadeo. Rango razonable: 1.0 a 3.0 s.
 DROWSY_TIME_SECONDS = 2.0
 
-# FPS (cuadros por segundo) que ASUMIMOS que va a procesar el programa. Esto
-# es una aproximación: no todas las computadoras procesan la cámara a la
-# misma velocidad. MediaPipe + OpenCV en Python, en una laptop típica, suele
-# rondar entre 10 y 20 cuadros por segundo (mucho menos que los 30 FPS
-# "nominales" de la cámara), así que 15 es un valor prudente por defecto.
-ASSUMED_FPS = 15
+# Histéresis del EAR. Una vez que el ojo cuenta como "cerrado" (EAR por
+# debajo de EAR_THRESHOLD), no vuelve a contar como "abierto" hasta que el
+# EAR sube por encima de EAR_THRESHOLD + este margen. Sirve para que el
+# contador de tiempo no se reinicie por oscilaciones del EAR justo en el
+# límite (si no, con los ojos entornados la alerta nunca llegaría a los 2 s).
+# Rango razonable: 0.01 a 0.04.
+EAR_HISTERESIS = 0.02
 
-# A partir del tiempo (en segundos) y los FPS asumidos, calculamos cuántos
-# FRAMES SEGUIDOS con EAR bajo necesitamos para confirmar somnolencia.
-# Con los valores de arriba: 2.0 segundos * 15 FPS = 30 frames.
-EAR_CONSEC_FRAMES = int(DROWSY_TIME_SECONDS * ASSUMED_FPS)
+# --- Cabeceos (pose de la cabeza / pitch) ---
+# Duración de la calibración inicial, en segundos. Apenas arranca el programa,
+# durante este tiempo se promedia el pitch para fijar la "posición neutra"
+# del conductor mirando al frente. Todo lo que viene después se mide como
+# desviación respecto de ese neutro. Rango razonable: 2.0 a 5.0 s (menos es
+# poco promedio; más hace esperar de gancho al arrancar).
+CALIBRACION_SEGUNDOS = 3.0
 
-# Configuración del pitido de alarma: frecuencia del sonido (en Hz, más alto
-# = más agudo) y duración de cada pitido (en milisegundos).
+# Ventana de la media móvil que SUAVIZA el pitch antes de evaluar los
+# umbrales, en segundos. Los landmarks tienen un poco de ruido cuadro a
+# cuadro; promediar los últimos ~0.12 s lo saca sin agregar un retraso
+# perceptible. Cuanto más grande, más estable pero más lento para reaccionar
+# a un cabeceo rápido. Rango razonable: 0.08 a 0.20 s.
+SUAVIZADO_PITCH_SEGUNDOS = 0.12
+
+# Cuánto hacia atrás se mira, en segundos, para medir la VELOCIDAD angular
+# del pitch (grados por segundo). La velocidad es (pitch_suavizado_ahora -
+# pitch_suavizado_hace_este_tiempo) dividido ese tiempo. Más chico = más
+# sensible a movimientos rápidos pero más ruidoso. Rango razonable:
+# 0.10 a 0.25 s.
+VENTANA_VELOCIDAD_SEGUNDOS = 0.18
+
+# --- Patrón 1: cabeza caída sostenida ---
+# Cuántos GRADOS por debajo del neutro tiene que estar el pitch para
+# considerar que la cabeza "está caída". Mirá el número "desv" en pantalla
+# con la cabeza derecha (cerca de 0) y con la cabeza caída hacia el pecho
+# (bien negativo) para elegir un valor en el medio. Rango típico: 12 a 25.
+#
+# Calibrado con la cámara real (valores de "desv" medidos tras recalibrar):
+#   mirando al frente ......................  ~0
+#   mirando el volante .....................  ~-5.5
+#   cabeza caída como si me durmiera .......  ~-17.5
+# 11.0 queda entre "mirar el volante" y "cabeza de sueño", más cerca del
+# primero para no perder detecciones reales; el requisito de que dure
+# CABEZA_CAIDA_SEGUNDOS descarta igual los vistazos rápidos al volante.
+CABEZA_CAIDA_GRADOS = 11.0
+
+# Cuántos SEGUNDOS seguidos tiene que mantenerse esa caída para disparar la
+# alerta. Una caída más corta puede ser mirar el tablero, la palanca o los
+# espejos. Rango típico: 1.0 a 3.0 s.
+CABEZA_CAIDA_SEGUNDOS = 1.5
+
+# Histéresis de la cabeza caída: margen (en grados) entre el umbral para
+# ENTRAR en estado de "cabeza caída" (-CABEZA_CAIDA_GRADOS) y el umbral para
+# SALIR de ese estado (-(CABEZA_CAIDA_GRADOS - este margen)). Evita que la
+# alerta parpadee cuando el pitch queda oscilando cerca del límite. Rango
+# razonable: 2 a 6 grados.
+CABEZA_CAIDA_HISTERESIS_GRADOS = 3.0
+
+# --- Patrón 2: cabeceo brusco (la "cabeceada" de sueño) ---
+# Velocidad mínima de caída, en GRADOS POR SEGUNDO, para empezar a contar un
+# cabeceo brusco. Es una caída rápida hacia abajo, no una posición. Un
+# movimiento tranquilo de la cabeza (mirar un espejo) ronda los 20-40 °/s;
+# una cabeceada de sueño suele estar entre 60 y 200 °/s. Mirá el valor "vel"
+# en pantalla moviendo la cabeza para calibrarlo. Rango típico: 45 a 120.
+CABECEO_VELOCIDAD_GRADOS_POR_SEG = 55.0
+
+# Cuántos grados como mínimo tiene que abarcar esa caída rápida, para no
+# contar temblores chiquitos que casualmente tuvieron velocidad alta.
+# Rango típico: 8 a 20.
+CABECEO_AMPLITUD_MINIMA_GRADOS = 10.0
+
+# Ventana máxima, en segundos, dentro de la cual la cabeza tiene que volver a
+# subir para que el evento cuente como "cabeceo brusco" (caída + recuperación
+# rápida). Si tarda más que esto en volver, ya no es un cabeceo: es una
+# cabeza caída sostenida, y la agarra el patrón 1. Rango típico: 0.5 a 1.2 s.
+CABECEO_VENTANA_RECUPERACION_SEG = 1.0
+
+# Qué fracción de lo que bajó la cabeza tiene que volver a subir para dar el
+# cabeceo por "recuperado". 0.5 = tiene que remontar al menos la mitad de la
+# caída. Rango razonable: 0.4 a 0.7.
+CABECEO_FRACCION_RECUPERACION = 0.5
+
+# Cuánto hacia atrás se mira, en segundos, para encontrar el pitch "de antes
+# del cabeceo" (el punto más alto reciente), que es contra el que se mide la
+# amplitud de la caída. Tiene que ser un poco más largo que una cabeceada
+# típica. Rango razonable: 0.4 a 0.8 s.
+VENTANA_PICO_CABECEO_SEG = 0.5
+
+# Cuántos segundos queda en pantalla el cartel de alerta por cabeceo brusco.
+# Como es un evento instantáneo, sin esto el cartel aparecería y desaparecería
+# tan rápido que no se llegaría a leer. Rango razonable: 2.0 a 5.0 s.
+DURACION_ALERTA_CABECEO_SEG = 3.0
+
+# --- Validación de la calibración inicial ---
+# Si el pitch varió más que esto (grados, pico a pico) durante los segundos
+# de calibración, quiere decir que el conductor se movió: se descarta esa
+# calibración y se reintenta. Rango razonable: 4 a 12 grados.
+CALIBRACION_ESTABILIDAD_MAX_GRADOS = 8.0
+
+# Si el yaw promedio (giro a los costados) durante la calibración supera esto
+# en valor absoluto, el conductor no está mirando de frente a la cámara: se
+# descarta y se reintenta. Rango razonable: 12 a 25 grados.
+CALIBRACION_YAW_MAX_GRADOS = 18.0
+
+# Cuántas veces se reintenta la calibración antes de aceptarla igual (con un
+# aviso de "calibración dudosa" en pantalla). Rango razonable: 2 a 5.
+CALIBRACION_MAX_INTENTOS = 3
+
+# --- Autoverificación del signo del pitch ---
+# El signo del pitch de solvePnP no es 100% predecible de antemano. El
+# programa lo verifica solo comparándolo con un proxy geométrico 2D
+# independiente (la distancia vertical nariz-ojos, que baja al mirar hacia
+# abajo). Estos dos valores controlan esa verificación:
+#
+# Ventana de tiempo, en segundos, sobre la que se compara el pitch con el
+# proxy. Rango razonable: 3 a 6 s.
+VENTANA_VERIF_SIGNO_SEG = 4.0
+# Cuánto se tiene que haber movido la cabeza (grados de pitch, pico a pico)
+# dentro de esa ventana para que la comparación tenga sentido. Con menos
+# movimiento no hay señal suficiente y no se toca nada. Rango razonable: 5 a 12.
+VERIF_SIGNO_MOV_MINIMO_GRADOS = 6.0
+
+# Signo del pitch. None = automático: el programa lo corrige solo apenas
+# movés un poco la cabeza. Si lo fijás en 1.0 o -1.0 se desactiva la
+# autodetección. Referencia: mirar HACIA ABAJO tiene que hacer que "desv" en
+# pantalla se vuelva NEGATIVO.
+#
+# Fijado en 1.0 tras probar con la cámara real: con este signo, bajar la
+# cabeza da "desv" negativo (mirando el volante ~-5.5, cabeza de sueño
+# ~-17.5). La autodetección (comparación con el proxy geométrico) NO
+# funcionó en la prueba real, por eso queda forzado a mano.
+SIGNO_PITCH = 1.0
+
+# --- Alarma sonora ---
+# Frecuencia del pitido (en Hz, más alto = más agudo) y duración de cada
+# pitido (en milisegundos).
 ALARM_FREQ_HZ = 2500
 ALARM_DURATION_MS = 700
 
-# Dirección de internet de donde se descarga el modelo de detección facial
-# de MediaPipe, y nombre con el que se guarda en la carpeta del proyecto.
+# --- Modelo de MediaPipe ---
+# Dirección de internet de donde se descarga el modelo de detección facial, y
+# nombre con el que se guarda en la carpeta del proyecto.
 MODELO_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
 MODELO_NOMBRE_ARCHIVO = "face_landmarker.task"
 
-# --- Configuración del acelerómetro (detección de cabezazos) ---
-# De dónde salen los datos del acelerómetro. Las opciones son:
-#   "simulador"   -> datos falsos generados por el programa. No necesita
-#                    hardware: sirve para probar que todo funciona. En este
-#                    modo podés apretar la tecla 'c' para simular un cabezazo.
-#   "clasico"     -> Bluetooth Clásico (módulos HC-05 / HC-06 con Arduino).
-#                    Requiere instalar pyserial y configurar PUERTO_COM.
-#   "ble"         -> Bluetooth Low Energy (ESP32 y sensores modernos).
-#                    Requiere instalar bleak y configurar los datos de abajo.
-#   "desactivado" -> ignora el acelerómetro por completo y usa solo la cámara.
-#
-# Este es el valor POR DEFECTO. También se puede elegir al ejecutar el
-# programa desde la consola, sin tocar el archivo, así:
-#     python detector_somnoliencia.py --modo desactivado
-MODO_SENSOR = "simulador"
-
-# Solo se usa si MODO_SENSOR es "clasico". Es el puerto COM que Windows le
-# asignó al módulo Bluetooth al emparejarlo (mirar en el Administrador de
-# dispositivos, bajo "Puertos (COM y LPT)").
-PUERTO_COM = "COM5"
-
-# Solo se usan si MODO_SENSOR es "ble": el nombre con el que el sensor se
-# anuncia por Bluetooth, y el UUID de la característica que manda los datos.
-# Ambos los define el firmware del sensor.
-NOMBRE_DISPOSITIVO_BLE = "AcelerometroCasco"
-UUID_CARACTERISTICA_BLE = "0000ffe1-0000-1000-8000-00805f9b34fb"
-
-# Cuántos segundos queda visible en pantalla el cartel de alerta por
-# cabezazos. A diferencia de la alerta por ojos cerrados (que se mantiene
-# sola mientras los ojos sigan cerrados), un cabezazo es un evento
-# instantáneo: si no lo dejáramos fijo un rato, el cartel aparecería y
-# desaparecería tan rápido que no llegarías a leerlo.
-DURACION_ALERTA_CABEZAZOS_SEG = 5.0
-
-# --- Configuración del sensor de pulso (frecuencia cardíaca / BPM) ---
-# De dónde salen los datos de BPM. Las opciones son:
-#   "simulador"   -> BPM falso generado por el programa. No necesita
-#                    hardware: en este modo podés forzar una caída llamando
-#                    a lector_pulso.forzar_caida() (ver sensor_pulso.py).
-#   "ble"         -> Bluetooth Low Energy, sensor con Heart Rate Service
-#                    estándar (por ejemplo, un Polar H10 o un Wahoo TICKR).
-#   "desactivado" -> ignora el sensor de pulso por completo.
-MODO_SENSOR_PULSO = "simulador"
-
-# Nombre anunciado por BLE del sensor de pulso. Solo se usa si no se indica
-# DIRECCION_BLE_PULSO (ver abajo).
-NOMBRE_BLE_PULSO = "Polar H10"
-
-# Dirección MAC del sensor de pulso (ej. "AA:BB:CC:DD:EE:FF"). Es OPCIONAL,
-# pero conectar por MAC es más rápido y más confiable para la reconexión
-# automática que buscar por nombre. Si es None, se busca por nombre.
-DIRECCION_BLE_PULSO = None
-
-# IMPORTANTE: la caída de BPM, por sí sola, NO dispara la alarma (el pulso
-# es una señal más débil y más lenta que los ojos cerrados o un cabezazo).
-# Solo cuenta como confirmación cuando se combina con OTRA señal (ojos
-# cerrados o cabezazos) que esté activa dentro de esta misma ventana de
-# tiempo. Este valor es cuánto tiempo (en segundos) después de confirmarse
-# una caída de BPM seguimos considerándola "vigente" para poder combinarla
-# con una señal de cámara o acelerómetro que aparezca poco después (o que ya
-# estuviera activa).
-DURACION_VENTANA_COMBINACION_PULSO_SEG = 10.0
-
 # --- Índices de los puntos de MediaPipe que forman cada ojo ---
-# MediaPipe numera sus puntos de la cara siempre en el mismo orden. Estos son los
-# 6 índices que corresponden al contorno de cada ojo, ya ordenados para que
-# coincidan con el dibujo de p1..p6 de la explicación de más arriba:
+# MediaPipe numera sus puntos de la cara siempre en el mismo orden. Estos son
+# los 6 índices del contorno de cada ojo, ordenados para que coincidan con el
+# dibujo de p1..p6 de la explicación de más arriba:
 #   posición 0 -> p1 (comisura izquierda del ojo)
 #   posición 1 -> p2 (párpado superior, lado izquierdo)
 #   posición 2 -> p3 (párpado superior, lado derecho)
@@ -231,9 +326,37 @@ DURACION_VENTANA_COMBINACION_PULSO_SEG = 10.0
 OJO_DERECHO_IDX = [33, 160, 158, 133, 153, 144]   # ojo derecho de la persona
 OJO_IZQUIERDO_IDX = [362, 385, 387, 263, 373, 380]  # ojo izquierdo de la persona
 
+# --- Modelo 3D genérico de cara, para estimar la pose de la cabeza ---
+# Son 6 puntos de una cara humana "promedio", en milímetros aproximados, con
+# la nariz en el origen. Es el modelo clásico que se usa con cv2.solvePnP.
+# El orden de estos puntos tiene que coincidir con MODELO_POSE_IDX de abajo.
+MODELO_POSE_3D = np.array([
+    (0.0,     0.0,     0.0),      # punta de la nariz
+    (0.0,  -330.0,   -65.0),      # mentón
+    (-225.0, 170.0,  -135.0),     # comisura externa del ojo del lado izq. de la imagen
+    (225.0,  170.0,  -135.0),     # comisura externa del ojo del lado der. de la imagen
+    (-150.0,-150.0,  -125.0),     # comisura de la boca del lado izq. de la imagen
+    (150.0, -150.0,  -125.0),     # comisura de la boca del lado der. de la imagen
+], dtype=np.float64)
+
+# Índices de MediaPipe que se corresponden, uno a uno y en el mismo orden,
+# con los puntos de MODELO_POSE_3D.
+MODELO_POSE_IDX = [1, 152, 33, 263, 61, 291]
+
+# Resultado de estimar la pose de la cabeza en un frame:
+#   pitch : inclinación vertical, en grados. ~0 de frente, NEGATIVO al mirar
+#           hacia abajo. Es el valor CRUDO (sin suavizar) y sin el signo
+#           automático aplicado (eso lo hace el DetectorCabeceos).
+#   yaw   : giro a los costados, en grados. Solo se usa para validar la
+#           calibración (mirar de frente = yaw chico).
+#   proxy : medida geométrica 2D auxiliar (distancia vertical nariz-ojos
+#           normalizada). Baja al mirar hacia abajo. Sirve para verificar
+#           que el signo del pitch sea el correcto.
+PoseCabeza = namedtuple("PoseCabeza", "pitch yaw proxy")
+
 
 # ==============================================================================
-# FUNCIONES
+# FUNCIONES DE GEOMETRÍA (EAR Y POSE DE LA CABEZA)
 # ==============================================================================
 
 def distancia_euclidiana(punto_a, punto_b):
@@ -285,6 +408,439 @@ def calcular_ear(puntos_ojo):
     return ear
 
 
+def estimar_pose(landmarks, ancho_frame, alto_frame):
+    """Estima la pose de la cabeza a partir de los landmarks de un frame.
+
+    IMPORTANTE: 'landmarks' tienen que venir del frame SIN espejar. La imagen
+    se espeja solo para mostrarla; si le pasáramos landmarks espejados, la
+    geometría de solvePnP quedaría reflejada (un espejo no es una rotación) y
+    el resultado sería inconsistente.
+
+    Usa cv2.solvePnP para encontrar la rotación del modelo 3D genérico
+    (MODELO_POSE_3D) que explica lo que se ve en la imagen. De las columnas de
+    la matriz de rotación (que son los ejes del rostro vistos desde la cámara)
+    saca el pitch y el yaw:
+
+      - pitch: la inclinación del eje "arriba de la cara". La intención es que
+        de frente dé ~0 y mirar hacia abajo dé NEGATIVO. Este método
+        (dirección de un eje + atan2) no tiene la ambigüedad de ±180° que
+        tenía descomponer en ángulos de Euler con RQDecomp3x3, pero el signo
+        de solvePnP igual puede salir invertido según cómo esté puesta la
+        cámara: por eso el DetectorCabeceos lo verifica y corrige solo,
+        comparándolo con 'proxy' (ver _verificar_signo).
+      - yaw: giro a los costados. Solo se usa para validar la calibración.
+
+    Devuelve un PoseCabeza(pitch, yaw, proxy) en grados (pitch/yaw), o None si
+    solvePnP no pudo resolver la pose en este frame."""
+    puntos_2d = np.array(
+        [(landmarks[idx].x * ancho_frame, landmarks[idx].y * alto_frame)
+         for idx in MODELO_POSE_IDX],
+        dtype=np.float64,
+    )
+
+    # Matriz de cámara aproximada: no calibramos la cámara real, alcanza con
+    # una estimación razonable (distancia focal ~ ancho del frame, centro
+    # óptico en el medio de la imagen). Sin coeficientes de distorsión.
+    focal = float(ancho_frame)
+    centro = (ancho_frame / 2.0, alto_frame / 2.0)
+    matriz_camara = np.array([
+        [focal, 0.0,   centro[0]],
+        [0.0,   focal, centro[1]],
+        [0.0,   0.0,   1.0],
+    ], dtype=np.float64)
+    sin_distorsion = np.zeros((4, 1), dtype=np.float64)
+
+    ok, vector_rotacion, _ = cv2.solvePnP(
+        MODELO_POSE_3D, puntos_2d, matriz_camara, sin_distorsion,
+        flags=cv2.SOLVEPNP_ITERATIVE,
+    )
+    if not ok:
+        return None
+
+    matriz_rotacion, _ = cv2.Rodrigues(vector_rotacion)
+    # Las columnas de la matriz de rotación son los ejes del rostro expresados
+    # en coordenadas de cámara (X derecha, Y abajo, Z hacia la escena).
+    eje_arriba = matriz_rotacion[:, 1]   # "arriba de la cara"
+    eje_frente = matriz_rotacion[:, 2]   # "hacia adelante de la cara"
+
+    # Pitch: elevación del eje "arriba". De frente el eje apunta hacia arriba
+    # en la imagen (Y de cámara negativa) -> atan2(0, 1) = 0. Al mirar hacia
+    # abajo, ese eje se inclina hacia la cámara (Z negativa) -> el ángulo
+    # crece, y le ponemos el signo menos para que "abajo" quede NEGATIVO.
+    pitch = -float(np.degrees(np.arctan2(-eje_arriba[2], -eje_arriba[1])))
+
+    # Yaw: hacia dónde apunta el frente de la cara. De frente a la cámara el
+    # eje apunta hacia el visor (Z negativa) -> atan2(0, 1) = 0.
+    yaw = float(np.degrees(np.arctan2(eje_frente[0], -eje_frente[2])))
+
+    # Proxy geométrico 2D, independiente de solvePnP: distancia vertical entre
+    # la nariz y la línea de los ojos, normalizada por la distancia entre
+    # ojos. Al mirar hacia abajo la nariz "sube" hacia los ojos en la imagen,
+    # así que el proxy BAJA. Se usa para verificar el signo del pitch.
+    nariz = landmarks[1]
+    ojo_a = landmarks[33]
+    ojo_b = landmarks[263]
+    ojos_medio_y = (ojo_a.y + ojo_b.y) / 2.0
+    interocular = abs(ojo_b.x - ojo_a.x)
+    proxy = (nariz.y - ojos_medio_y) / interocular if interocular > 1e-6 else 0.0
+
+    return PoseCabeza(pitch=pitch, yaw=yaw, proxy=proxy)
+
+
+# ==============================================================================
+# DETECTOR DE CABECEOS
+# ==============================================================================
+
+class DetectorCabeceos:
+    """Recibe la pose de la cabeza cuadro a cuadro y avisa cuando hay una
+    señal de somnolencia por movimiento de cabeza.
+
+    Se usa así: se le pasa el PoseCabeza de cada frame con
+    'procesar(pose, ahora)' y devuelve una tupla (cabeza_caida, cabeceo):
+
+      - cabeza_caida: True MIENTRAS la cabeza siga caída más de lo permitido
+        durante el tiempo requerido (patrón 1).
+      - cabeceo:      True SOLO en el instante en que se confirma un cabeceo
+        brusco (patrón 2).
+
+    Antes de detectar nada se toma CALIBRACION_SEGUNDOS para promediar el
+    pitch neutro (conductor mirando al frente). Esa calibración se valida (si
+    el conductor se movió mucho o no miraba al frente, se descarta y se
+    reintenta hasta CALIBRACION_MAX_INTENTOS veces). Mientras calibra,
+    'calibrando' vale True y siempre devuelve (False, False). Se puede rehacer
+    en cualquier momento con recalibrar().
+
+    Además verifica solo el signo del pitch: si el de solvePnP resulta
+    invertido para este equipo, lo corrige apenas el conductor mueve un poco
+    la cabeza (ver _verificar_signo)."""
+
+    def __init__(self):
+        # Momento en que llegó la primera muestra (arranque de la calibración).
+        self.tiempo_arranque = None
+
+        # --- Calibración ---
+        # Muestras juntadas durante la calibración (pitch YA con el signo
+        # efectivo aplicado, yaw y proxy), y los promedios finales (None hasta
+        # que la calibración termina y queda validada).
+        self._muestras_calibracion = []
+        self._yaws_calibracion = []
+        self._proxys_calibracion = []
+        self.pitch_neutro = None
+        self.proxy_neutro = None
+        self.calibrando = True
+        self._intentos_calibracion = 0
+        self.aviso_calibracion = ""       # motivo del reintento, para el HUD
+        self.calibracion_dudosa = False   # se aceptó tras agotar los intentos
+
+        # --- Signo del pitch ---
+        # Signo autodetectado (se usa solo si SIGNO_PITCH es None). Arranca en
+        # +1 y se puede invertir una vez en _verificar_signo.
+        self._signo_auto = 1.0
+        self._signo_verificado = False
+        # Historial (tiempo, desviacion_pitch, proxy - proxy_neutro) para la
+        # verificación del signo.
+        self._historial_signo = deque()
+
+        # Historial reciente de (tiempo, pitch_crudo_con_signo), para la media
+        # móvil que suaviza el pitch.
+        self._historial = deque()
+
+        # Historial de (tiempo, pitch_YA_suavizado), para medir la velocidad
+        # angular y encontrar el pico previo a un cabeceo.
+        self._historial_suave = deque()
+
+        # --- Patrón 1: cabeza caída sostenida ---
+        self._tiempo_inicio_caida = None
+        self._cabeza_caida_estado = False   # con histéresis (ver _evaluar_cabeza_caida)
+
+        # --- Patrón 2: cabeceo brusco ---
+        self._en_cabeceo = False
+        self._cabeceo_tiempo_inicio = None
+        self._cabeceo_pitch_inicio = None
+        self._cabeceo_pitch_minimo = None
+
+        # Valores expuestos solo para mostrar en pantalla y calibrar.
+        self.pitch_crudo = 0.0        # pitch del frame, con signo, sin suavizar
+        self.pitch_suavizado = 0.0
+        self.desviacion = 0.0
+        self.ultima_velocidad = 0.0
+        self.segundos_caida = 0.0
+
+    def _signo_efectivo(self):
+        """+1 o -1: el SIGNO_PITCH manual si está fijado, o el autodetectado."""
+        if SIGNO_PITCH is not None:
+            return float(SIGNO_PITCH)
+        return self._signo_auto
+
+    def recalibrar(self):
+        """Descarta la calibración actual y arranca una nueva. La detección
+        queda en pausa hasta que la nueva calibración termine y valide.
+        El signo del pitch ya aprendido NO se toca (es propiedad del equipo,
+        no de la postura)."""
+        self.tiempo_arranque = None
+        self._muestras_calibracion = []
+        self._yaws_calibracion = []
+        self._proxys_calibracion = []
+        self.pitch_neutro = None
+        self.proxy_neutro = None
+        self.calibrando = True
+        self._intentos_calibracion = 0
+        self.aviso_calibracion = ""
+        self.calibracion_dudosa = False
+        self._historial_signo.clear()
+        self._historial.clear()
+        self._historial_suave.clear()
+        self._tiempo_inicio_caida = None
+        self._cabeza_caida_estado = False
+        self._en_cabeceo = False
+        self._cabeceo_tiempo_inicio = None
+        self._cabeceo_pitch_inicio = None
+        self._cabeceo_pitch_minimo = None
+        self.desviacion = 0.0
+        self.ultima_velocidad = 0.0
+        self.segundos_caida = 0.0
+
+    def procesar(self, pose, ahora):
+        """Procesa el PoseCabeza de un frame, tomado en el instante 'ahora'
+        (segundos, de time.time()). Devuelve (cabeza_caida, cabeceo)."""
+        if self.tiempo_arranque is None:
+            self.tiempo_arranque = ahora
+
+        # El pitch entra ya con el signo efectivo aplicado; de acá para
+        # adelante todo (neutro, desviación, velocidad) es consistente.
+        pitch = pose.pitch * self._signo_efectivo()
+        self.pitch_crudo = pitch
+
+        # --- Suavizado: media móvil corta sobre el pitch crudo ---
+        self._historial.append((ahora, pitch))
+        while (len(self._historial) > 2
+               and self._historial[0][0] < ahora - SUAVIZADO_PITCH_SEGUNDOS):
+            self._historial.popleft()
+        self.pitch_suavizado = sum(p for _, p in self._historial) / len(self._historial)
+
+        # --- Historial del pitch suavizado, para medir la velocidad y para
+        # encontrar el "pico" de pitch justo antes de un cabeceo ---
+        self._historial_suave.append((ahora, self.pitch_suavizado))
+        ventana_larga = max(VENTANA_VELOCIDAD_SEGUNDOS, VENTANA_PICO_CABECEO_SEG)
+        while (len(self._historial_suave) > 2
+               and self._historial_suave[0][0] < ahora - ventana_larga):
+            self._historial_suave.popleft()
+
+        # --- Calibración de la posición neutra (con validación) ---
+        if self.pitch_neutro is None:
+            self._muestras_calibracion.append(pitch)
+            self._yaws_calibracion.append(pose.yaw)
+            self._proxys_calibracion.append(pose.proxy)
+            listo = (ahora - self.tiempo_arranque) >= CALIBRACION_SEGUNDOS
+            if listo and len(self._muestras_calibracion) >= 5:
+                self._cerrar_calibracion(ahora)
+            return False, False
+
+        self.desviacion = self.pitch_suavizado - self.pitch_neutro
+        self.ultima_velocidad = self._velocidad_angular(ahora)
+        self._verificar_signo(ahora, pose.proxy)
+
+        # El orden importa poco, pero evaluamos primero el cabeceo brusco:
+        # si NO se recupera a tiempo, deja de ser cabeceo y el patrón 1 se
+        # encarga de la cabeza caída.
+        cabeceo = self._evaluar_cabeceo_brusco(ahora)
+        cabeza_caida = self._evaluar_cabeza_caida(ahora)
+        return cabeza_caida, cabeceo
+
+    def _cerrar_calibracion(self, ahora):
+        """Se llama cuando ya pasó el tiempo de calibración y hay suficientes
+        muestras. Valida que el conductor estuviera quieto y mirando de
+        frente; si no, descarta y reintenta (o acepta con aviso tras agotar
+        los intentos)."""
+        pitchs = self._muestras_calibracion
+        spread = max(pitchs) - min(pitchs)
+        yaw_medio = sum(self._yaws_calibracion) / len(self._yaws_calibracion)
+
+        if spread > CALIBRACION_ESTABILIDAD_MAX_GRADOS:
+            motivo = "te moviste demasiado"
+        elif abs(yaw_medio) > CALIBRACION_YAW_MAX_GRADOS:
+            motivo = "no estas mirando de frente a la camara"
+        else:
+            motivo = None
+
+        def fijar_neutro():
+            self.pitch_neutro = sum(pitchs) / len(pitchs)
+            self.proxy_neutro = (
+                sum(self._proxys_calibracion) / len(self._proxys_calibracion)
+            )
+            self.calibrando = False
+
+        if motivo is None:
+            fijar_neutro()
+            self.aviso_calibracion = ""
+            print(f"Calibracion OK. Pitch neutro = {self.pitch_neutro:+.1f} grados.")
+            return
+
+        self._intentos_calibracion += 1
+        if self._intentos_calibracion >= CALIBRACION_MAX_INTENTOS:
+            fijar_neutro()
+            self.calibracion_dudosa = True
+            self.aviso_calibracion = ""
+            print(f"AVISO: calibracion dudosa ({motivo}). Se usa igual; apreta "
+                  f"'c' para rehacerla mirando al frente y quieto.")
+            return
+
+        # Reintento: vaciamos las muestras y volvemos a arrancar el reloj.
+        self.aviso_calibracion = f"Calibracion: {motivo}. Reintentando..."
+        print(f"Calibracion: {motivo}. Reintentando...")
+        self._muestras_calibracion = []
+        self._yaws_calibracion = []
+        self._proxys_calibracion = []
+        self.tiempo_arranque = ahora
+
+    def _verificar_signo(self, ahora, proxy):
+        """Comprueba una sola vez que el signo del pitch de solvePnP sea el
+        correcto, comparándolo con el proxy geométrico 2D. Ambos deberían
+        bajar juntos al mirar hacia abajo; si van al revés, invierte el signo.
+
+        No hace nada si el signo está fijado a mano (SIGNO_PITCH) o si todavía
+        no hubo suficiente movimiento de cabeza para poder juzgar."""
+        if SIGNO_PITCH is not None or self._signo_verificado:
+            return
+        if self.proxy_neutro is None:
+            return
+
+        self._historial_signo.append((ahora, self.desviacion, proxy - self.proxy_neutro))
+        while (len(self._historial_signo) > 2
+               and self._historial_signo[0][0] < ahora - VENTANA_VERIF_SIGNO_SEG):
+            self._historial_signo.popleft()
+        if len(self._historial_signo) < 8:
+            return
+
+        desv_pitch = [d for _, d, _ in self._historial_signo]
+        desv_proxy = [q for _, _, q in self._historial_signo]
+        if (max(desv_pitch) - min(desv_pitch)) < VERIF_SIGNO_MOV_MINIMO_GRADOS:
+            return  # la cabeza casi no se movió: no hay con qué juzgar todavía
+
+        correlacion = float(np.corrcoef(desv_pitch, desv_proxy)[0, 1])
+        if np.isnan(correlacion):
+            return
+
+        if correlacion <= -0.4:
+            # Pitch y proxy se mueven al revés -> el pitch está invertido.
+            self._signo_auto = -self._signo_auto
+            # El neutro se calculó con el signo viejo: al invertir el signo,
+            # el neutro nuevo es el opuesto. Los historiales quedaron con el
+            # signo viejo, así que se limpian.
+            self.pitch_neutro = -self.pitch_neutro
+            self._historial.clear()
+            self._historial_suave.clear()
+            self._tiempo_inicio_caida = None
+            self._cabeza_caida_estado = False
+            self._en_cabeceo = False
+            self.desviacion = 0.0
+            self._signo_verificado = True
+            print("AVISO: el pitch venia invertido para esta camara; corregido "
+                  "automaticamente.")
+        elif correlacion >= 0.4:
+            # Signo correcto confirmado: no volvemos a chequear.
+            self._signo_verificado = True
+
+    def _velocidad_angular(self, ahora):
+        """Velocidad de cambio del pitch, en grados por segundo: cuánto cambió
+        el pitch suavizado en los últimos ~VENTANA_VELOCIDAD_SEGUNDOS,
+        dividido ese tiempo. Negativa = la cabeza está bajando."""
+        if len(self._historial_suave) < 2:
+            return 0.0
+
+        objetivo = ahora - VENTANA_VELOCIDAD_SEGUNDOS
+        # Muestra más nueva que sea al menos tan vieja como 'objetivo'.
+        referencia = self._historial_suave[0]
+        for muestra in self._historial_suave:
+            if muestra[0] <= objetivo:
+                referencia = muestra
+            else:
+                break
+
+        t_ref, p_ref = referencia
+        t_nuevo, p_nuevo = self._historial_suave[-1]
+        dt = t_nuevo - t_ref
+        if dt < 1e-3:
+            return 0.0
+        return (p_nuevo - p_ref) / dt
+
+    def _evaluar_cabeza_caida(self, ahora):
+        """Patrón 1: la cabeza quedó inclinada hacia abajo más de
+        CABEZA_CAIDA_GRADOS durante más de CABEZA_CAIDA_SEGUNDOS.
+
+        Con HISTÉRESIS: para ENTRAR en estado de "cabeza caída" el pitch tiene
+        que bajar de -CABEZA_CAIDA_GRADOS; para SALIR tiene que volver por
+        encima de -(CABEZA_CAIDA_GRADOS - CABEZA_CAIDA_HISTERESIS_GRADOS). Así
+        el temporizador no se reinicia por oscilaciones chicas cerca del
+        límite y la alerta no parpadea."""
+        umbral_entrar = -CABEZA_CAIDA_GRADOS
+        umbral_salir = -(CABEZA_CAIDA_GRADOS - CABEZA_CAIDA_HISTERESIS_GRADOS)
+
+        if not self._cabeza_caida_estado:
+            if self.desviacion <= umbral_entrar:
+                self._cabeza_caida_estado = True
+        else:
+            if self.desviacion > umbral_salir:
+                self._cabeza_caida_estado = False
+
+        if self._cabeza_caida_estado:
+            if self._tiempo_inicio_caida is None:
+                self._tiempo_inicio_caida = ahora
+            self.segundos_caida = ahora - self._tiempo_inicio_caida
+            return self.segundos_caida >= CABEZA_CAIDA_SEGUNDOS
+
+        self._tiempo_inicio_caida = None
+        self.segundos_caida = 0.0
+        return False
+
+    def _evaluar_cabeceo_brusco(self, ahora):
+        """Patrón 2: caída rápida de la cabeza seguida de una recuperación
+        (vuelve a subir) en menos de CABECEO_VENTANA_RECUPERACION_SEG."""
+        if not self._en_cabeceo:
+            # ¿Arranca una caída rápida?
+            if self.ultima_velocidad <= -CABECEO_VELOCIDAD_GRADOS_POR_SEG:
+                self._en_cabeceo = True
+                self._cabeceo_tiempo_inicio = ahora
+                # El punto de partida NO es el pitch de ahora (que, por el
+                # suavizado y por la ventana con que medimos la velocidad, ya
+                # bajó bastante): es el pitch más alto de los últimos
+                # instantes, o sea la posición de la cabeza justo antes de
+                # empezar a caer.
+                self._cabeceo_pitch_inicio = max(
+                    p for _, p in self._historial_suave
+                )
+                self._cabeceo_pitch_minimo = self.pitch_suavizado
+            return False
+
+        # Estamos en medio de un posible cabeceo: seguimos el punto más bajo.
+        self._cabeceo_pitch_minimo = min(self._cabeceo_pitch_minimo,
+                                         self.pitch_suavizado)
+        amplitud = self._cabeceo_pitch_inicio - self._cabeceo_pitch_minimo
+        transcurrido = ahora - self._cabeceo_tiempo_inicio
+
+        if transcurrido > CABECEO_VENTANA_RECUPERACION_SEG:
+            # No volvió a subir a tiempo: no es un cabeceo "brusco". Si la
+            # cabeza sigue abajo, lo toma el patrón 1.
+            self._en_cabeceo = False
+            return False
+
+        # ¿Ya remontó al menos una fracción de lo que había bajado?
+        subida_desde_minimo = self.pitch_suavizado - self._cabeceo_pitch_minimo
+        recuperado = subida_desde_minimo >= CABECEO_FRACCION_RECUPERACION * amplitud
+
+        if (amplitud >= CABECEO_AMPLITUD_MINIMA_GRADOS
+                and recuperado
+                and subida_desde_minimo >= CABECEO_AMPLITUD_MINIMA_GRADOS * 0.5):
+            self._en_cabeceo = False
+            return True
+
+        return False
+
+
+# ==============================================================================
+# MODELO DE MEDIAPIPE Y PROCESAMIENTO DE FRAMES
+# ==============================================================================
+
 def asegurar_modelo_descargado():
     """Se fija si el archivo del modelo de MediaPipe ya existe en la carpeta
     del proyecto. Si no existe (por ejemplo, la primera vez que corrés el
@@ -333,18 +889,25 @@ def crear_detector_facial():
 
 def procesar_frame(frame, detector_facial, timestamp_ms):
     """Le pasa el frame a MediaPipe y, si encontró una cara, calcula el EAR
-    promedio de ambos ojos.
+    promedio de ambos ojos y la pose de la cabeza.
+
+    IMPORTANTE: 'frame' tiene que ser el frame CRUDO de la cámara, sin
+    espejar. El espejado se hace después, solo sobre la copia que se muestra
+    en pantalla, para no romper la geometría de la pose (ver estimar_pose).
 
     'timestamp_ms' es un número que tiene que ir SIEMPRE EN AUMENTO entre
     llamada y llamada (MediaPipe, al trabajar en modo VIDEO, exige que cada
     cuadro tenga una marca de tiempo mayor a la del cuadro anterior, para
     saber en qué orden ocurrieron). No hace falta que sea el tiempo real:
-    alcanza con un contador que sume de a uno en cada frame.
+    alcanza con un contador que sume de a uno en cada frame. OJO: esto es
+    solo para que MediaPipe ordene los cuadros; NADA de la lógica de
+    detección se mide con este contador (esa se mide con time.time()).
 
-    Devuelve una tupla (ear_promedio, puntos_ojo_izq, puntos_ojo_der).
-    Si NO se detectó ninguna cara en el frame, devuelve (None, None, None)
-    para que quien llama a esta función sepa que no hay datos válidos y no
-    intente hacer cuentas con "nada"."""
+    Devuelve la tupla (ear_promedio, pose, puntos_ojo_izq, puntos_ojo_der),
+    con 'pose' un PoseCabeza (o None). Los puntos de los ojos son en píxeles
+    del frame CRUDO. Si NO se detectó ninguna cara, devuelve
+    (None, None, None, None). 'pose' puede ser None aunque haya cara, si
+    solvePnP no pudo resolver la pose en ese frame."""
     alto_frame, ancho_frame = frame.shape[:2]
 
     # MediaPipe espera la imagen en formato RGB, pero OpenCV lee la cámara
@@ -357,7 +920,7 @@ def procesar_frame(frame, detector_facial, timestamp_ms):
     # Si MediaPipe no encontró ninguna cara en este frame (por ejemplo,
     # porque tapaste la cámara), la lista 'face_landmarks' viene vacía.
     if not resultado.face_landmarks:
-        return None, None, None
+        return None, None, None, None
 
     # Tomamos la primera cara detectada (asumimos que hay un solo conductor
     # mirando a la cámara).
@@ -374,8 +937,18 @@ def procesar_frame(frame, detector_facial, timestamp_ms):
     # el promedio con el otro ojo amortigua ese ruido y evita falsas alarmas.
     ear_promedio = (ear_der + ear_izq) / 2.0
 
-    return ear_promedio, puntos_ojo_izq, puntos_ojo_der
+    # Pose de la cabeza (puede fallar y devolver None en algún frame suelto).
+    try:
+        pose = estimar_pose(landmarks, ancho_frame, alto_frame)
+    except cv2.error:
+        pose = None
 
+    return ear_promedio, pose, puntos_ojo_izq, puntos_ojo_der
+
+
+# ==============================================================================
+# ALARMA SONORA
+# ==============================================================================
 
 def reproducir_alarma():
     """Reproduce un pitido de alarma usando el altavoz de la computadora.
@@ -391,59 +964,16 @@ def reproducir_alarma():
     winsound.Beep(ALARM_FREQ_HZ, ALARM_DURATION_MS)
 
 
-def dibujar_alerta(frame):
-    """Dibuja el aviso visual de alerta (texto rojo) sobre el frame."""
-    alto_frame, ancho_frame = frame.shape[:2]
-    texto = "ALERTA! SOMNOLENCIA DETECTADA"
-
-    # Dibujamos un rectángulo rojo de fondo para que el texto se lea bien
-    # sin importar lo que haya detrás en la imagen de la cámara.
-    cv2.rectangle(frame, (0, 0), (ancho_frame, 60), (0, 0, 255), -1)
-    cv2.putText(
-        frame, texto, (10, 40),
-        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA
-    )
-
-
-def dibujar_alerta_cabezazos(frame):
-    """Dibuja el aviso visual de alerta por cabezazos detectados.
-
-    Se dibuja más abajo que la alerta por ojos cerrados para que, si las dos
-    saltan al mismo tiempo, no se pisen y se puedan leer ambas."""
-    alto_frame, ancho_frame = frame.shape[:2]
-    texto = "ALERTA! CABEZAZOS DETECTADOS"
-
-    cv2.rectangle(frame, (0, 60), (ancho_frame, 115), (0, 0, 255), -1)
-    cv2.putText(
-        frame, texto, (10, 98),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA
-    )
-
-
-def dibujar_alerta_pulso_combinada(frame):
-    """Dibuja el aviso visual de alerta combinada: caída de BPM confirmada
-    junto con otra señal (ojos cerrados o cabezazos) ya activa.
-
-    Se dibuja más abajo que las otras dos alertas, en su propia franja, para
-    que las tres puedan verse a la vez si llegaran a coincidir."""
-    alto_frame, ancho_frame = frame.shape[:2]
-    texto = "ALERTA! CAIDA DE PULSO + OTRA SENAL"
-
-    cv2.rectangle(frame, (0, 115), (ancho_frame, 170), (0, 0, 255), -1)
-    cv2.putText(
-        frame, texto, (10, 153),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA
-    )
-
-
 def disparar_alarma_si_corresponde(hilo_alarma):
     """Lanza el pitido de alarma en un hilo nuevo, si no hay uno sonando ya.
 
     Devuelve el hilo (nuevo o el que ya estaba) para que quien la llama lo
-    siga teniendo a mano. Esta función la usan TANTO la alerta por ojos
-    cerrados COMO la alerta por cabezazos: ambas comparten la misma alarma,
-    y este guard compartido evita que se pisen entre sí si las dos se
-    disparan casi al mismo tiempo."""
+    siga teniendo a mano. Esta función la comparten las TRES condiciones de
+    alerta (ojos cerrados, cabeza caída y cabeceo brusco): el guard
+    'is_alive()' evita que, si varias se activan casi juntas o una se
+    mantiene varios segundos, se disparen decenas de pitidos superpuestos.
+    Se reproduce un pitido y, apenas termina, si la condición sigue, arranca
+    el siguiente."""
     if hilo_alarma is None or not hilo_alarma.is_alive():
         hilo_alarma = threading.Thread(target=reproducir_alarma, daemon=True)
         # 'daemon=True' significa que este hilo no va a impedir que el
@@ -453,411 +983,245 @@ def disparar_alarma_si_corresponde(hilo_alarma):
     return hilo_alarma
 
 
-def dibujar_info_sensor(frame, detector_cabezazos, sensor_conectado):
-    """Muestra en pantalla el estado del acelerómetro.
+# ==============================================================================
+# DIBUJO SOBRE LA IMAGEN
+# ==============================================================================
 
-    Igual que la info de EAR, esto no hace falta para que la alarma
-    funcione: sirve para ver en vivo qué está midiendo el sensor y poder
-    ajustar el umbral con números reales delante."""
-    if not sensor_conectado:
-        cv2.putText(frame, "Acelerometro: SIN SENAL", (10, frame.shape[0] - 65),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
-        return
-
-    texto = (f"Cabezazos: {detector_cabezazos.cantidad_eventos_recientes()}"
-             f"/{sensor.MIN_CABEZAZOS_PARA_ALERTA}"
-             f"  (mov: {detector_cabezazos.ultima_desviacion:.1f})")
-    cv2.putText(frame, texto, (10, frame.shape[0] - 65),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+def dibujar_alerta_ojos(frame):
+    """Cartel rojo de alerta por ojos cerrados (franja de arriba de todo)."""
+    ancho_frame = frame.shape[1]
+    cv2.rectangle(frame, (0, 0), (ancho_frame, 55), (0, 0, 255), -1)
+    cv2.putText(frame, "ALERTA! OJOS CERRADOS", (10, 38),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
 
 
-def dibujar_info_pulso(frame, detector_bpm, sensor_conectado):
-    """Muestra en pantalla el estado del sensor de pulso: el último BPM
-    válido leído, o un aviso si no hay señal (desconectado o sin buen
-    contacto con la piel)."""
-    if not sensor_conectado or not detector_bpm.hay_senal_valida():
-        cv2.putText(frame, "Pulso: SIN SENAL", (10, frame.shape[0] - 90),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
-        return
+def dibujar_alerta_cabeza_caida(frame):
+    """Cartel rojo de alerta por cabeza caída sostenida (segunda franja).
 
-    texto = f"Pulso: {detector_bpm.ultimo_bpm_valido} BPM"
-    cv2.putText(frame, texto, (10, frame.shape[0] - 90),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+    Se dibuja más abajo que la de ojos para que, si las dos saltan al mismo
+    tiempo, no se pisen y se puedan leer ambas."""
+    ancho_frame = frame.shape[1]
+    cv2.rectangle(frame, (0, 55), (ancho_frame, 105), (0, 0, 255), -1)
+    cv2.putText(frame, "ALERTA! CABEZA CAIDA", (10, 90),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
 
 
-def dibujar_info_debug(frame, ear_promedio, frames_ojos_cerrados):
-    """Dibuja en pantalla el valor actual de EAR y el contador de frames.
-
-    Esto no es necesario para que la alarma funcione: es solo información
-    útil para que puedas ver "en vivo" qué está pensando el programa mientras
-    lo probás, y así entender por qué dispara (o no dispara) la alarma."""
-    texto_ear = f"EAR: {ear_promedio:.3f}"
-    texto_contador = f"Frames ojos cerrados: {frames_ojos_cerrados}/{EAR_CONSEC_FRAMES}"
-
-    cv2.putText(frame, texto_ear, (10, frame.shape[0] - 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
-    cv2.putText(frame, texto_contador, (10, frame.shape[0] - 15),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+def dibujar_alerta_cabeceo(frame):
+    """Cartel rojo de alerta por cabeceo brusco (tercera franja)."""
+    ancho_frame = frame.shape[1]
+    cv2.rectangle(frame, (0, 105), (ancho_frame, 155), (0, 0, 255), -1)
+    cv2.putText(frame, "ALERTA! CABECEO BRUSCO", (10, 140),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
 
 
-def leer_opciones_de_consola():
-    """Lee las opciones que se pasan al ejecutar el programa desde la consola.
+def dibujar_hud(frame, ear_promedio, segundos_ojos_cerrados, detector_cabeceos):
+    """Muestra en pantalla, abajo a la izquierda, los valores en vivo (EAR,
+    pitch crudo y suavizado, desviación, velocidad, temporizadores). No hace
+    falta para que la alarma funcione: es para poder CALIBRAR los umbrales
+    mirando la imagen. Mostrar el pitch crudo y el suavizado por separado
+    permite ver si el ruido viene del cálculo (salta el crudo, no el
+    suavizado) o de algún otro lado."""
+    alto_frame = frame.shape[0]
+    verde = (0, 255, 0)
+    amarillo = (0, 255, 255)
+    fuente = cv2.FONT_HERSHEY_SIMPLEX
 
-    Gracias a esto podés cambiar de modo sin editar el archivo. Por ejemplo:
+    # Línea 1: EAR y cuánto tiempo llevan los ojos cerrados.
+    if ear_promedio is not None:
+        texto_ear = (f"EAR: {ear_promedio:.3f} (umbral {EAR_THRESHOLD:.2f})   "
+                     f"ojos cerrados: {segundos_ojos_cerrados:.1f}s"
+                     f" / {DROWSY_TIME_SECONDS:.1f}s")
+    else:
+        texto_ear = "EAR: --   (sin rostro)"
+    cv2.putText(frame, texto_ear, (10, alto_frame - 66),
+                fuente, 0.6, verde, 2, cv2.LINE_AA)
 
-        python detector_somnoliencia.py --modo simulador
-        python detector_somnoliencia.py --modo desactivado
-        python detector_somnoliencia.py --modo ble --nombre-ble MiSensor
-
-    Si no pasás ninguna opción, se usan los valores por defecto definidos
-    arriba en las CONSTANTES DE CONFIGURACIÓN."""
-    analizador = argparse.ArgumentParser(
-        description="Detector de somnolencia: ojos cerrados (camara) y cabezazos (acelerometro)."
-    )
-    analizador.add_argument(
-        "--modo",
-        default=MODO_SENSOR,
-        choices=["simulador", "clasico", "ble", "desactivado"],
-        help="De donde salen los datos del acelerometro. Por defecto: %(default)s",
-    )
-    analizador.add_argument(
-        "--puerto",
-        default=PUERTO_COM,
-        help="Puerto COM del modulo Bluetooth Clasico. Por defecto: %(default)s",
-    )
-    analizador.add_argument(
-        "--nombre-ble",
-        default=NOMBRE_DISPOSITIVO_BLE,
-        help="Nombre del dispositivo BLE. Por defecto: %(default)s",
-    )
-    analizador.add_argument(
-        "--uuid-ble",
-        default=UUID_CARACTERISTICA_BLE,
-        help="UUID de la caracteristica BLE que envia los datos.",
-    )
-    analizador.add_argument(
-        "--modo-pulso",
-        default=MODO_SENSOR_PULSO,
-        choices=["simulador", "ble", "desactivado"],
-        help="De donde salen los datos de pulso (BPM). Por defecto: %(default)s",
-    )
-    analizador.add_argument(
-        "--nombre-ble-pulso",
-        default=NOMBRE_BLE_PULSO,
-        help="Nombre del sensor de pulso BLE. Por defecto: %(default)s",
-    )
-    analizador.add_argument(
-        "--direccion-ble-pulso",
-        default=DIRECCION_BLE_PULSO,
-        help="Direccion MAC del sensor de pulso BLE (opcional, mas confiable que el nombre).",
-    )
-    return analizador.parse_args()
+    # Línea 2 y 3: estado de la pose de la cabeza.
+    if detector_cabeceos.calibrando:
+        mensaje = (detector_cabeceos.aviso_calibracion
+                   or "Calibrando pose de la cabeza... MIRA AL FRENTE Y QUEDATE QUIETO")
+        cv2.putText(frame, mensaje, (10, alto_frame - 40),
+                    fuente, 0.6, amarillo, 2, cv2.LINE_AA)
+    elif detector_cabeceos.pitch_neutro is not None:
+        texto_pose = (f"pitch crudo: {detector_cabeceos.pitch_crudo:+.1f}   "
+                      f"suav: {detector_cabeceos.pitch_suavizado:+.1f}   "
+                      f"desv: {detector_cabeceos.desviacion:+.1f}")
+        cv2.putText(frame, texto_pose, (10, alto_frame - 40),
+                    fuente, 0.6, verde, 2, cv2.LINE_AA)
+        marca_dudosa = "  [CALIB. DUDOSA - apreta 'c']" if detector_cabeceos.calibracion_dudosa else ""
+        texto_pose2 = (f"vel: {detector_cabeceos.ultima_velocidad:+.0f}/s   "
+                       f"caida: {detector_cabeceos.segundos_caida:.1f}s"
+                       f" / {CABEZA_CAIDA_SEGUNDOS:.1f}s{marca_dudosa}")
+        color2 = amarillo if detector_cabeceos.calibracion_dudosa else verde
+        cv2.putText(frame, texto_pose2, (10, alto_frame - 16),
+                    fuente, 0.6, color2, 2, cv2.LINE_AA)
+    else:
+        cv2.putText(frame, "pitch: -- (sin pose)", (10, alto_frame - 40),
+                    fuente, 0.6, amarillo, 2, cv2.LINE_AA)
 
 
-def main(opciones=None):
-    """Función principal: abre la cámara y corre el bucle de detección.
+# ==============================================================================
+# BUCLE PRINCIPAL
+# ==============================================================================
 
-    'opciones' son las elegidas desde la consola. Si no se pasa ninguna
-    (por ejemplo, si alguien llama a main() desde otro script), se usan
-    los valores por defecto de las constantes."""
-    if opciones is None:
-        opciones = argparse.Namespace(
-            modo=MODO_SENSOR,
-            puerto=PUERTO_COM,
-            nombre_ble=NOMBRE_DISPOSITIVO_BLE,
-            uuid_ble=UUID_CARACTERISTICA_BLE,
-            modo_pulso=MODO_SENSOR_PULSO,
-            nombre_ble_pulso=NOMBRE_BLE_PULSO,
-            direccion_ble_pulso=DIRECCION_BLE_PULSO,
-        )
-
+def main():
+    """Función principal: abre la cámara y corre el bucle de detección."""
     # --- Preparamos el detector facial de MediaPipe ---
     detector_facial = crear_detector_facial()
 
-    # --- Preparamos el acelerómetro (detección de cabezazos) ---
-    # Si algo falla al conectar con el sensor (Bluetooth apagado, puerto COM
-    # equivocado, librería sin instalar), NO cortamos el programa: avisamos y
-    # seguimos funcionando solo con la cámara. La idea es que un problema con
-    # el sensor no te deje sin la detección por ojos, que es la principal.
-    lector_sensor = None
-    detector_cabezazos = sensor.DetectorCabezazos()
-
-    if opciones.modo != "desactivado":
-        try:
-            lector_sensor = sensor.crear_lector(
-                opciones.modo,
-                puerto_com=opciones.puerto,
-                nombre_ble=opciones.nombre_ble,
-                uuid_ble=opciones.uuid_ble,
-            )
-            lector_sensor.iniciar()
-            print(f"Acelerometro iniciado en modo '{opciones.modo}'.")
-        except Exception as error:
-            print(f"AVISO: no se pudo iniciar el acelerometro ({error}).")
-            print("El programa sigue funcionando solo con la camara.")
-            lector_sensor = None
-
-    # --- Preparamos el sensor de pulso (BPM) ---
-    # Mismo criterio que con el acelerómetro: si falla la conexión, no
-    # cortamos el programa, seguimos con las señales que sí estén disponibles.
-    lector_pulso = None
-    detector_bpm = pulso.DetectorAnomaliaBPM()
-
-    if opciones.modo_pulso != "desactivado":
-        try:
-            lector_pulso = pulso.crear_lector(
-                opciones.modo_pulso,
-                nombre_ble=opciones.nombre_ble_pulso,
-                direccion_ble=opciones.direccion_ble_pulso,
-            )
-            lector_pulso.iniciar()
-            print(f"Sensor de pulso iniciado en modo '{opciones.modo_pulso}'.")
-        except Exception as error:
-            print(f"AVISO: no se pudo iniciar el sensor de pulso ({error}).")
-            print("El programa sigue funcionando sin esa señal.")
-            lector_pulso = None
+    # --- Detector de cabeceos (pose de la cabeza) ---
+    detector_cabeceos = DetectorCabeceos()
 
     # --- Abrimos la webcam ---
-    # El '0' significa "la primera cámara disponible en la computadora".
-    captura = cv2.VideoCapture(0)
+    captura = cv2.VideoCapture(CAMARA_INDICE)
 
     if not captura.isOpened():
         # Si no se pudo abrir la cámara (no hay cámara, está siendo usada
         # por otro programa, permisos de Windows bloqueados, etc.), avisamos
         # con un mensaje claro y cortamos el programa en vez de romper con
         # un error críptico más adelante.
-        print("ERROR: no se pudo acceder a la webcam.")
+        print(f"ERROR: no se pudo acceder a la webcam (indice {CAMARA_INDICE}).")
         print("Verificá que la cámara esté conectada, que no la esté usando")
-        print("otra aplicación, y que Windows tenga permitido el acceso a la")
-        print("cámara para aplicaciones de escritorio.")
+        print("otra aplicación, y que el sistema tenga permitido el acceso a")
+        print("la cámara. Si tenés varias cámaras, probá otro valor en la")
+        print("constante CAMARA_INDICE.")
         return
 
-    # Contador de cuántos frames SEGUIDOS llevamos con el EAR por debajo del
-    # umbral. Se reinicia a 0 apenas el EAR vuelve a subir (ojos abiertos),
-    # de modo que solo cuenta "rachas" continuas de ojos cerrados, no el
-    # total acumulado en todo el programa. Así, parpadear varias veces
-    # nunca hace sumar frames de una racha a otra.
-    frames_ojos_cerrados = 0
+    # Momento en que empezó la racha actual de "ojos cerrados" (None si los
+    # ojos están abiertos). La duración de la racha se calcula como
+    # 'ahora - este_momento', SIEMPRE con el reloj, nunca contando frames.
+    tiempo_ojos_cerrados_inicio = None
+    segundos_ojos_cerrados = 0.0
+
+    # Estado "ojos cerrados" con histéresis: se entra con EAR < EAR_THRESHOLD
+    # y se sale recién con EAR > EAR_THRESHOLD + EAR_HISTERESIS, así el
+    # contador de tiempo no se reinicia por oscilaciones del EAR en el límite.
+    ojos_cerrados_estado = False
 
     # Referencia al hilo del pitido de alarma, para no lanzar varios pitidos
-    # superpuestos al mismo tiempo (ver comentario más abajo).
+    # superpuestos al mismo tiempo.
     hilo_alarma = None
 
-    # Contador que le vamos a pasar a MediaPipe como "marca de tiempo" de
-    # cada frame. Tiene que aumentar siempre (ver comentario en
-    # 'procesar_frame'), así que simplemente le sumamos 1 en cada vuelta.
+    # Momento del último cabeceo brusco confirmado (None si no hubo, o si ya
+    # pasó su tiempo en pantalla). El cartel se mantiene visible unos
+    # segundos porque el cabeceo es un evento instantáneo.
+    momento_alerta_cabeceo = None
+
+    # Contador que le pasamos a MediaPipe como "marca de tiempo" de cada
+    # frame. Solo sirve para que MediaPipe ordene los cuadros; no se usa para
+    # ninguna medición de la lógica de detección.
     contador_timestamp_ms = 0
 
-    # Momento (según el reloj de la computadora) en que se disparó la última
-    # alerta por cabezazos. Sirve para mantener el cartel visible unos
-    # segundos. Vale None mientras no haya habido ninguna alerta.
-    momento_alerta_cabezazos = None
-
-    # Momento en que llegó la última muestra del acelerómetro, para poder
-    # avisar si el sensor se queda sin señal.
-    momento_ultima_muestra = time.monotonic()
-
-    # Lo mismo que arriba, pero para el sensor de pulso.
-    momento_ultima_muestra_pulso = time.monotonic()
-
-    # Momento en que se confirmó la última caída sostenida de BPM (o None si
-    # no hay ninguna vigente). Se usa solo para la REGLA DE COMBINACIÓN: ver
-    # comentario junto a DURACION_VENTANA_COMBINACION_PULSO_SEG.
-    momento_alerta_bpm = None
-
-    # Para no imprimir el mismo aviso de alerta combinada en cada vuelta del
-    # bucle mientras siga activa: solo avisamos por consola en el instante en
-    # que pasa de "no activa" a "activa" (el cartel en pantalla, en cambio,
-    # sí se puede seguir dibujando todos los frames sin problema).
-    alerta_combinada_bpm_activa = False
-
-    print("Detector de somnolencia iniciado. Presioná 'q' en la ventana de")
-    print("video para salir.")
-    if opciones.modo == "simulador":
-        print("Modo simulador: presioná 'c' para simular un cabezazo.")
-    if opciones.modo_pulso == "simulador":
-        print("Modo simulador de pulso: presioná 'b' para bajar el pulso")
-        print("(y mantenerlo bajo) y 'n' para devolverlo a la normalidad.")
+    print("Detector de somnolencia iniciado.")
+    print(f"Calibrando la pose de la cabeza durante {CALIBRACION_SEGUNDOS:.0f} "
+          f"segundos: mirá al frente y quedate quieto.")
+    print("Presioná 'q' para salir, 'c' para volver a calibrar la pose.")
 
     while True:
-        # Leemos un frame (una imagen) de la cámara.
-        ret, frame = captura.read()
+        # Leemos un frame (una imagen) de la cámara. Este 'frame_crudo' NO se
+        # espeja: toda la detección (MediaPipe, EAR, pose) trabaja sobre él.
+        ret, frame_crudo = captura.read()
         if not ret:
             # 'ret' es False si por algún motivo no se pudo leer un frame
             # (por ejemplo, la cámara se desconectó a mitad de la ejecución).
             print("ERROR: se perdió la conexión con la cámara.")
             break
 
-        # Espejamos el frame horizontalmente (efecto "espejo"), para que se
-        # sienta más natural mirarse a uno mismo en la pantalla (como en un
-        # espejo real, no invertido).
-        frame = cv2.flip(frame, 1)
+        # Momento actual, en segundos. TODA la lógica temporal usa esto.
+        ahora = time.time()
 
         contador_timestamp_ms += 1
-        ear_promedio, puntos_ojo_izq, puntos_ojo_der = procesar_frame(
-            frame, detector_facial, contador_timestamp_ms
+        ear_promedio, pose, puntos_ojo_izq, puntos_ojo_der = procesar_frame(
+            frame_crudo, detector_facial, contador_timestamp_ms
         )
 
-        # Se recalcula en cada vuelta del bucle: True solo si, EN ESTE FRAME,
-        # la racha de ojos cerrados ya llegó al umbral. La usa también la
-        # regla de combinación con el sensor de pulso, más abajo.
-        somnoliento = False
+        # A partir de acá trabajamos sobre 'lienzo': la copia ESPEJADA que se
+        # muestra en pantalla (efecto espejo, más natural para mirarse). Es
+        # solo visual; la detección ya se hizo sobre el frame crudo.
+        lienzo = cv2.flip(frame_crudo, 1)
+        ancho_lienzo = lienzo.shape[1]
 
+        # ==================================================================
+        # SEÑAL 1: OJOS CERRADOS (EAR)
+        # ==================================================================
         if ear_promedio is None:
-            # No se detectó ninguna cara en este frame. Reiniciamos el
-            # contador para no arrastrar una racha de "ojos cerrados" que en
-            # realidad puede deberse a que la cara salió de cuadro, y le
-            # avisamos al usuario en pantalla.
-            frames_ojos_cerrados = 0
-            cv2.putText(frame, "No se detecta rostro", (10, 30),
+            # No se detectó ninguna cara. Cortamos la racha de ojos cerrados
+            # para no arrastrar una que en realidad es "la cara salió de
+            # cuadro", y avisamos en pantalla.
+            tiempo_ojos_cerrados_inicio = None
+            segundos_ojos_cerrados = 0.0
+            ojos_cerrados_estado = False
+            cv2.putText(lienzo, "No se detecta rostro", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
         else:
-            # Dibujamos pequeños círculos sobre los puntos de cada ojo, para
-            # poder ver visualmente qué está midiendo el programa.
-            for punto in puntos_ojo_izq + puntos_ojo_der:
-                cv2.circle(frame, punto, 2, (0, 255, 0), -1)
+            # Dibujamos los puntos de cada ojo (con la x espejada, porque los
+            # puntos vienen en coordenadas del frame crudo y el lienzo está
+            # espejado).
+            for (x, y) in puntos_ojo_izq + puntos_ojo_der:
+                cv2.circle(lienzo, (ancho_lienzo - 1 - x, y), 2, (0, 255, 0), -1)
 
-            if ear_promedio < EAR_THRESHOLD:
-                # El EAR está por debajo del umbral en este frame: sumamos
-                # uno a la racha de "ojos cerrados".
-                frames_ojos_cerrados += 1
+            # Histéresis: entrar en "ojos cerrados" con EAR < umbral, salir
+            # recién cuando el EAR supera umbral + EAR_HISTERESIS.
+            if not ojos_cerrados_estado and ear_promedio < EAR_THRESHOLD:
+                ojos_cerrados_estado = True
+            elif ojos_cerrados_estado and ear_promedio > EAR_THRESHOLD + EAR_HISTERESIS:
+                ojos_cerrados_estado = False
+
+            if ojos_cerrados_estado:
+                # Si es el comienzo de la racha anotamos el momento; si ya
+                # venía, medimos cuánto lleva (con el reloj, no con frames).
+                if tiempo_ojos_cerrados_inicio is None:
+                    tiempo_ojos_cerrados_inicio = ahora
+                segundos_ojos_cerrados = ahora - tiempo_ojos_cerrados_inicio
             else:
-                # Los ojos están abiertos en este frame: cortamos la racha.
-                frames_ojos_cerrados = 0
+                tiempo_ojos_cerrados_inicio = None
+                segundos_ojos_cerrados = 0.0
 
-            dibujar_info_debug(frame, ear_promedio, frames_ojos_cerrados)
-
-            # ¿La racha de ojos cerrados ya llegó al umbral configurado?
-            somnoliento = frames_ojos_cerrados >= EAR_CONSEC_FRAMES
-
-            if somnoliento:
-                dibujar_alerta(frame)
-
-                # Lanzamos el pitido solo si no hay ya uno sonando. Esto
-                # evita que, si los ojos siguen cerrados durante varios
-                # segundos, se disparen decenas de pitidos superpuestos por
-                # segundo: en cambio, se va reproduciendo un pitido, y apenas
-                # termina, si seguís con los ojos cerrados, arranca el
-                # siguiente.
+            if segundos_ojos_cerrados >= DROWSY_TIME_SECONDS:
+                dibujar_alerta_ojos(lienzo)
                 hilo_alarma = disparar_alarma_si_corresponde(hilo_alarma)
 
         # ==================================================================
-        # PARTE 2: EL ACELERÓMETRO (DETECCIÓN DE CABEZAZOS)
+        # SEÑAL 2: CABECEOS (POSE DE LA CABEZA)
         # ==================================================================
-        # Esta parte es independiente de la de la cámara: aunque no se
-        # detecte ninguna cara, los cabezazos se siguen midiendo.
-        if lector_sensor is not None:
-            # Levantamos todas las muestras que hayan llegado por Bluetooth
-            # desde la vuelta anterior del bucle. Esta llamada NO espera: si
-            # todavía no llegó nada, devuelve una lista vacía y seguimos de
-            # largo, así el video nunca se frena esperando al sensor.
-            muestras = lector_sensor.leer_muestras()
+        # Independiente de los ojos: se calcula siempre que haya una pose
+        # válida, aunque el EAR de ese frame haya fallado.
+        if pose is not None:
+            cabeza_caida, cabeceo_brusco = detector_cabeceos.procesar(pose, ahora)
 
-            if muestras:
-                momento_ultima_muestra = time.monotonic()
-
-            for muestra in muestras:
-                if detector_cabezazos.procesar_muestra(muestra):
-                    # Se juntaron los cabezazos suficientes dentro de la
-                    # ventana de tiempo: alerta.
-                    print("ALERTA: se detectaron cabezazos / movimientos bruscos.")
-                    momento_alerta_cabezazos = time.monotonic()
-                    hilo_alarma = disparar_alarma_si_corresponde(hilo_alarma)
-
-            # ¿Hace cuánto que no llega ninguna muestra? Si pasó demasiado
-            # tiempo, damos el sensor por desconectado.
-            sensor_conectado = (
-                (time.monotonic() - momento_ultima_muestra) < sensor.TIMEOUT_SENSOR_SEG
-            )
-            dibujar_info_sensor(frame, detector_cabezazos, sensor_conectado)
-
-            # Mantenemos el cartel de alerta en pantalla unos segundos
-            # después del evento, para que dé tiempo a leerlo.
-            if momento_alerta_cabezazos is not None:
-                transcurrido = time.monotonic() - momento_alerta_cabezazos
-                if transcurrido < DURACION_ALERTA_CABEZAZOS_SEG:
-                    dibujar_alerta_cabezazos(frame)
-                else:
-                    momento_alerta_cabezazos = None
-
-        # ==================================================================
-        # PARTE 3: EL SENSOR DE PULSO (CAÍDA DE BPM)
-        # ==================================================================
-        # También independiente de la cámara y del acelerómetro: se sigue
-        # midiendo el pulso aunque no haya rostro en cuadro o no haya habido
-        # ningún cabezazo.
-        if lector_pulso is not None:
-            muestras_pulso = lector_pulso.leer_muestras()
-
-            if muestras_pulso:
-                momento_ultima_muestra_pulso = time.monotonic()
-
-            for muestra in muestras_pulso:
-                if detector_bpm.procesar_muestra(muestra):
-                    # Caída de BPM sostenida confirmada. OJO: esto todavía NO
-                    # es una alerta por sí sola (ver comentario en
-                    # DURACION_VENTANA_COMBINACION_PULSO_SEG): solo queda
-                    # "vigente" por un rato para poder combinarse con la
-                    # cámara o el acelerómetro.
-                    print("SEÑAL: caída sostenida de BPM (posible somnolencia).")
-                    momento_alerta_bpm = time.monotonic()
-
-            pulso_conectado = (
-                (time.monotonic() - momento_ultima_muestra_pulso) < pulso.TIMEOUT_SENSOR_SEG
-            )
-            dibujar_info_pulso(frame, detector_bpm, pulso_conectado)
-
-            # --- Regla de combinación ---
-            # La caída de BPM, sola, no dispara la alarma. Solo cuenta cuando
-            # todavía está "vigente" (dentro de su ventana de combinación) Y,
-            # al mismo tiempo, hay otra señal activa: ojos cerrados AHORA
-            # MISMO, o un cabezazo cuyo cartel siga en pantalla. Como esta
-            # comprobación se repite en cada vuelta del bucle, funciona sin
-            # importar cuál de las dos señales haya aparecido primero.
-            pulso_vigente = (
-                momento_alerta_bpm is not None
-                and (time.monotonic() - momento_alerta_bpm) < DURACION_VENTANA_COMBINACION_PULSO_SEG
-            )
-            cabezazos_activo = momento_alerta_cabezazos is not None
-
-            if pulso_vigente and (somnoliento or cabezazos_activo):
-                if not alerta_combinada_bpm_activa:
-                    print("ALERTA: caída de BPM confirmada junto con otra señal de somnolencia.")
-                alerta_combinada_bpm_activa = True
-                dibujar_alerta_pulso_combinada(frame)
+            if cabeza_caida:
+                dibujar_alerta_cabeza_caida(lienzo)
                 hilo_alarma = disparar_alarma_si_corresponde(hilo_alarma)
-            else:
-                alerta_combinada_bpm_activa = False
 
-        # Mostramos el frame resultante en una ventana.
-        cv2.imshow("Detector de Somnolencia", frame)
+            if cabeceo_brusco:
+                print("ALERTA: cabeceo brusco detectado.")
+                momento_alerta_cabeceo = ahora
+                hilo_alarma = disparar_alarma_si_corresponde(hilo_alarma)
+
+        # Mantenemos el cartel de cabeceo unos segundos después del evento.
+        if momento_alerta_cabeceo is not None:
+            if (ahora - momento_alerta_cabeceo) < DURACION_ALERTA_CABECEO_SEG:
+                dibujar_alerta_cabeceo(lienzo)
+            else:
+                momento_alerta_cabeceo = None
+
+        # Info en vivo para calibrar (EAR y pitch en pantalla).
+        dibujar_hud(lienzo, ear_promedio, segundos_ojos_cerrados, detector_cabeceos)
+
+        # Mostramos el lienzo (imagen espejada) en una ventana.
+        cv2.imshow("Detector de Somnolencia", lienzo)
 
         # Esperamos 1 milisegundo a que se presione una tecla. El '& 0xFF' es
         # una forma estándar de comparar la tecla en distintos sistemas
         # operativos.
         tecla = cv2.waitKey(1) & 0xFF
-
         if tecla == ord('q'):
             print("Saliendo del programa...")
             break
-
-        # En modo simulador, la tecla 'c' genera un cabezazo falso. Sirve
-        # para probar la alerta sin tener el sensor real: apretala dos veces
-        # con menos de 20 segundos de diferencia y debería saltar la alarma.
-        if tecla == ord('c') and isinstance(lector_sensor, sensor.LectorSimulado):
-            lector_sensor.forzar_cabezazo()
-            print("Cabezazo simulado.")
-
-        # En modo simulador de pulso, 'b' baja el BPM simulado y lo mantiene
-        # bajo (para probar la caída sostenida y la alerta combinada sin
-        # tener el sensor real), y 'n' lo devuelve a la normalidad.
-        if tecla == ord('b') and isinstance(lector_pulso, pulso.LectorSimulado):
-            lector_pulso.forzar_caida_manual()
-            print("Pulso bajo simulado (sostenido). Presioná 'n' para volver a la normalidad.")
-
-        if tecla == ord('n') and isinstance(lector_pulso, pulso.LectorSimulado):
-            lector_pulso.restaurar_pulso_normal()
-            print("Pulso simulado vuelto a la normalidad.")
+        if tecla == ord('c'):
+            detector_cabeceos.recalibrar()
+            print("Recalibrando la pose de la cabeza: mirá al frente y "
+                  "quedate quieto.")
 
     # --- Liberamos los recursos antes de terminar ---
     # Muy importante: si no liberamos la cámara, puede quedar "ocupada" y
@@ -867,17 +1231,9 @@ def main(opciones=None):
     cv2.destroyAllWindows()
     detector_facial.close()
 
-    # También cerramos la conexión con el acelerómetro y con el sensor de
-    # pulso, para liberar el Bluetooth y que quede disponible para la
-    # próxima ejecución.
-    if lector_sensor is not None:
-        lector_sensor.detener()
-    if lector_pulso is not None:
-        lector_pulso.detener()
-
 
 # Este bloque hace que 'main()' se ejecute solo cuando corrés este archivo
 # directamente (por ejemplo, con "python detector_somnoliencia.py"), y no si
 # alguna vez este archivo se importa desde otro script de Python.
 if __name__ == "__main__":
-    main(leer_opciones_de_consola())
+    main()
