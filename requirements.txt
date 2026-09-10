@@ -5,18 +5,3 @@
 # sí, provocando errores difíciles de diagnosticar).
 mediapipe>=0.10,<2.0
 numpy>=1.26
-
-# --- Dependencias OPCIONALES del acelerómetro ---
-# No hacen falta para usar la cámara ni el modo simulador. Instalá solo la
-# que corresponda al hardware que uses, descomentando la línea:
-#
-#   Bluetooth Clásico (módulos HC-05 / HC-06 con Arduino):
-# pyserial>=3.5
-#
-#   Bluetooth Low Energy (ESP32 y sensores modernos):
-# bleak>=0.21
-
-# --- Dependencia OPCIONAL del sensor de pulso (BPM) ---
-# Usa la misma libreria 'bleak' de arriba (protocolo BLE estandar Heart
-# Rate Service, UUID 0x180D): si ya la descomentaste para el acelerometro
-# BLE, no hace falta agregar nada mas.
