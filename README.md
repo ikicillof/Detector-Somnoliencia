@@ -71,8 +71,9 @@ python detector_somnoliencia.py
   cabeza caída. Esos números son los que se usan para calibrar los umbrales.
 - Al arrancar (y cada vez que apretás `c`) hay unos segundos de
   **calibración**: mirá al frente y quedate quieto. Si te movés o no mirás
-  de frente, la calibración se descarta y se reintenta sola; tras varios
-  intentos se acepta igual con el aviso `CALIB. DUDOSA` en pantalla.
+  de frente, la calibración se descarta y se reintenta sola, todas las veces
+  que haga falta, sin tocar ninguna tecla. Mientras tanto la detección de
+  ojos cerrados sigue funcionando.
 - Presioná **`q`** con la ventana enfocada para cerrar el programa
   correctamente.
 - Presioná **`c`** para volver a calibrar la posición neutra de la cabeza

@@ -276,9 +276,12 @@ CALIBRACION_ESTABILIDAD_MAX_GRADOS = 8.0
 # descarta y se reintenta. Rango razonable: 12 a 25 grados.
 CALIBRACION_YAW_MAX_GRADOS = 18.0
 
-# Cuántas veces se reintenta la calibración antes de aceptarla igual (con un
-# aviso de "calibración dudosa" en pantalla). Rango razonable: 2 a 5.
-CALIBRACION_MAX_INTENTOS = 3
+# Si la calibración falla, se REINTENTA SOLA, sin límite y sin tocar ninguna
+# tecla, hasta que salga bien: nunca se acepta una calibración mala. Mientras
+# tanto la detección de ojos cerrados funciona igual; solo la de cabeceos
+# queda en pausa. Cada esta cantidad de intentos fallidos seguidos se imprime
+# un recordatorio de que los cabeceos todavía no se están vigilando.
+CALIBRACION_AVISO_CADA_INTENTOS = 3
 
 # --- Autoverificación del signo del pitch ---
 # El signo del pitch de solvePnP no es 100% predecible de antemano. El
@@ -533,7 +536,7 @@ class DetectorCabeceos:
     Antes de detectar nada se toma CALIBRACION_SEGUNDOS para promediar el
     pitch neutro (conductor mirando al frente). Esa calibración se valida (si
     el conductor se movió mucho o no miraba al frente, se descarta y se
-    reintenta hasta CALIBRACION_MAX_INTENTOS veces). Mientras calibra,
+    reintenta sola, todas las veces que haga falta). Mientras calibra,
     'calibrando' vale True y siempre devuelve (False, False). Se puede rehacer
     en cualquier momento con recalibrar().
 
@@ -557,7 +560,6 @@ class DetectorCabeceos:
         self.calibrando = True
         self._intentos_calibracion = 0
         self.aviso_calibracion = ""       # motivo del reintento, para el HUD
-        self.calibracion_dudosa = False   # se aceptó tras agotar los intentos
 
         # --- Signo del pitch ---
         # Signo autodetectado (se usa solo si SIGNO_PITCH es None). Arranca en
@@ -613,7 +615,6 @@ class DetectorCabeceos:
         self.calibrando = True
         self._intentos_calibracion = 0
         self.aviso_calibracion = ""
-        self.calibracion_dudosa = False
         self._historial_signo.clear()
         self._historial.clear()
         self._historial_suave.clear()
@@ -703,18 +704,17 @@ class DetectorCabeceos:
             print(f"Calibracion OK. Pitch neutro = {self.pitch_neutro:+.1f} grados.")
             return
 
+        # Falló: se reintenta sola. Vaciamos las muestras y volvemos a
+        # arrancar el reloj; no hace falta tocar ninguna tecla.
         self._intentos_calibracion += 1
-        if self._intentos_calibracion >= CALIBRACION_MAX_INTENTOS:
-            fijar_neutro()
-            self.calibracion_dudosa = True
-            self.aviso_calibracion = ""
-            print(f"AVISO: calibracion dudosa ({motivo}). Se usa igual; apreta "
-                  f"'c' para rehacerla mirando al frente y quieto.")
-            return
-
-        # Reintento: vaciamos las muestras y volvemos a arrancar el reloj.
-        self.aviso_calibracion = f"Calibracion: {motivo}. Reintentando..."
-        print(f"Calibracion: {motivo}. Reintentando...")
+        self.aviso_calibracion = (f"Calibracion: {motivo}. Reintentando "
+                                  f"(intento {self._intentos_calibracion + 1})...")
+        print(f"Calibracion fallida ({motivo}). Reintentando automaticamente "
+              f"(intento {self._intentos_calibracion + 1}): mira al frente y "
+              f"quedate quieto.")
+        if self._intentos_calibracion % CALIBRACION_AVISO_CADA_INTENTOS == 0:
+            print("AVISO: la deteccion de cabeceos sigue en pausa hasta que la "
+                  "calibracion salga bien (la de ojos cerrados funciona igual).")
         self._muestras_calibracion = []
         self._yaws_calibracion = []
         self._proxys_calibracion = []
@@ -1279,13 +1279,11 @@ def dibujar_hud(frame, ear_promedio, segundos_ojos_cerrados, detector_cabeceos):
                       f"desv: {detector_cabeceos.desviacion:+.1f}")
         cv2.putText(frame, texto_pose, (10, alto_frame - 40),
                     fuente, 0.6, verde, 2, cv2.LINE_AA)
-        marca_dudosa = "  [CALIB. DUDOSA - apreta 'c']" if detector_cabeceos.calibracion_dudosa else ""
         texto_pose2 = (f"vel: {detector_cabeceos.ultima_velocidad:+.0f}/s   "
                        f"caida: {detector_cabeceos.segundos_caida:.1f}s"
-                       f" / {CABEZA_CAIDA_SEGUNDOS:.1f}s{marca_dudosa}")
-        color2 = amarillo if detector_cabeceos.calibracion_dudosa else verde
+                       f" / {CABEZA_CAIDA_SEGUNDOS:.1f}s")
         cv2.putText(frame, texto_pose2, (10, alto_frame - 16),
-                    fuente, 0.6, color2, 2, cv2.LINE_AA)
+                    fuente, 0.6, verde, 2, cv2.LINE_AA)
     else:
         cv2.putText(frame, "pitch: -- (sin pose)", (10, alto_frame - 40),
                     fuente, 0.6, amarillo, 2, cv2.LINE_AA)
