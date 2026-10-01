@@ -68,7 +68,12 @@ El detector ya corría en la Pi, pero con parches a mano y mucho delay:
 - Este archivo.
 
 **Cambio posterior:** el buzzer pasó del GPIO18 (pin 12) al **GPIO21
-(pin físico 40)**.
+(pin físico 40)**. Buzzer probado en la Pi: funciona (faltaba instalar
+`gpiozero`/`lgpio` en el venv con `./instalar_pi.sh`).
+
+**Pitido de calibración:** al terminar bien la calibración suena un pitido
+muy corto (`NIVEL_CALIBRADO`, 0,08 s), con menor prioridad que las alertas.
+En modo solo visual no imprime nada extra.
 
 ### Cómo se probó
 
@@ -81,9 +86,9 @@ El detector ya corría en la Pi, pero con parches a mano y mucho delay:
 
 ### Pendiente
 
-- [ ] Probar en la Pi: `git pull`, `./instalar_pi.sh` y
+- [x] Probar en la Pi: `git pull`, `./instalar_pi.sh` y
       `python detector_somnoliencia.py --sin-ventana`.
-- [ ] Confirmar que el buzzer suena con los dos patrones.
+- [x] Confirmar que el buzzer suena (falta escuchar bien cada patrón).
 - [ ] Medir FPS reales en la Pi (línea cada 5 s) y elegir resolución /
       `--saltar` adecuados.
 - [ ] Revisar `vcgencmd get_throttled` (fuente y temperatura).
