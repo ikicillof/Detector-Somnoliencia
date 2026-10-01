@@ -24,7 +24,7 @@ El detector ya corría en la Pi, pero con parches a mano y mucho delay:
 - Eliminado `winsound`. Nueva clase `Alarma` (`disparar`, `callar`,
   `cerrar`) que elige la salida al arrancar:
   - Raspberry Pi (detectada por `/proc/device-tree/model`): buzzer activo
-    con gpiozero + lgpio en `BUZZER_GPIO = 18` (pin físico 12, vía
+    con gpiozero + lgpio en `BUZZER_GPIO = 21` (pin físico 40, vía
     transistor NPN; cableado documentado en el código).
   - PC/Windows: tono de 2500 Hz con `sounddevice` + `numpy`.
   - Si falla la librería: advertencia y alarma solo visual/consola.
@@ -66,6 +66,9 @@ El detector ya corría en la Pi, pero con parches a mano y mucho delay:
   buzzer, problemas conocidos).
 - `CLAUDE.md` con las restricciones permanentes.
 - Este archivo.
+
+**Cambio posterior:** el buzzer pasó del GPIO18 (pin 12) al **GPIO21
+(pin físico 40)**.
 
 ### Cómo se probó
 
