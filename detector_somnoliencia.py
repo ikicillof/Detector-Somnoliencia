@@ -127,6 +127,7 @@ import time
 import argparse   # Para leer opciones de la línea de comandos (--sin-ventana).
 import queue      # Cola segura entre hilos (comandos escritos en la consola).
 import signal     # Para cerrar ordenadamente si el sistema pide terminar.
+import subprocess # Para consultar 'vcgencmd' en la Raspberry Pi.
 import platform   # Para saber en qué sistema operativo estamos (Windows,
                   # Linux...) y elegir cómo hacer sonar la alarma.
 import threading
@@ -910,6 +911,11 @@ def crear_detector_facial():
         running_mode=mp_vision.RunningMode.VIDEO,
         min_face_detection_confidence=0.5,
         min_tracking_confidence=0.5,
+        # Salidas extra que NO usamos: apagarlas ahorra trabajo en cada
+        # cuadro (sobre todo los "blendshapes", que corren otra red
+        # neuronal más). Solo necesitamos los puntos de la cara.
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=False,
     )
     return mp_vision.FaceLandmarker.create_from_options(opciones)
 
@@ -1290,6 +1296,193 @@ def dibujar_hud(frame, ear_promedio, segundos_ojos_cerrados, detector_cabeceos):
 
 
 # ==============================================================================
+# CAPTURA DE LA CÁMARA EN UN HILO APARTE
+# ==============================================================================
+#
+# ¿POR QUÉ UN HILO APARTE?
+# La cámara entrega cuadros a un ritmo fijo (por ejemplo 30 por segundo). Si
+# el programa procesa más lento que eso (le pasa a la Raspberry Pi, donde
+# MediaPipe tarda bastante por cuadro), los cuadros que no llegó a leer se
+# van acumulando en una cola dentro del driver de la cámara. Cada vez que el
+# programa pide "el próximo cuadro" recibe uno VIEJO, de hace varios
+# segundos: eso es el "delay" que se veía en la Pi. Para un detector de
+# somnolencia eso es grave: la alarma sonaría tarde.
+#
+# La solución: un hilo dedicado que lee la cámara sin parar, lo más rápido
+# que ella entregue, y guarda SOLO el último cuadro (los anteriores se
+# descartan). El bucle de procesamiento, cuando termina con un cuadro, toma
+# siempre el más reciente. Así nunca se procesa una imagen vieja.
+
+def abrir_camara(indice, ancho, alto):
+    """Abre la cámara con la configuración que menos delay genera.
+
+    - Backend según la plataforma: V4L2 en Linux (el nativo; es el que
+      respeta bien formato y tamaño de buffer) y DirectShow en Windows (que
+      acepta pedir MJPG). Si con ese backend no abre, se prueba el automático.
+    - Formato MJPG: la cámara manda cada cuadro ya comprimido en JPEG. Por
+      USB pasan muchos menos datos que en crudo (YUYV), así que la cámara
+      puede dar más cuadros por segundo a la misma resolución.
+    - Buffer de 1 cuadro: que el driver no guarde cuadros viejos.
+    - Resolución: si 'ancho'/'alto' son None se deja la que trae la cámara.
+
+    Devuelve el cv2.VideoCapture abierto, o None si no se pudo abrir."""
+    sistema = platform.system()
+    if sistema == "Linux":
+        backend = cv2.CAP_V4L2
+    elif sistema == "Windows":
+        backend = cv2.CAP_DSHOW
+    else:
+        backend = cv2.CAP_ANY
+
+    captura = cv2.VideoCapture(indice, backend)
+    if not captura.isOpened() and backend != cv2.CAP_ANY:
+        captura.release()
+        captura = cv2.VideoCapture(indice)
+    if not captura.isOpened():
+        captura.release()
+        return None
+
+    # Orden importante: primero el formato, después la resolución (algunos
+    # drivers solo ofrecen ciertas resoluciones en MJPG).
+    captura.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    if ancho and alto:
+        captura.set(cv2.CAP_PROP_FRAME_WIDTH, ancho)
+        captura.set(cv2.CAP_PROP_FRAME_HEIGHT, alto)
+    captura.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # no todos los backends lo aceptan
+
+    # Mostramos lo que la cámara REALMENTE aceptó (puede ignorar el pedido).
+    fourcc = int(captura.get(cv2.CAP_PROP_FOURCC))
+    formato = "".join(chr((fourcc >> (8 * i)) & 0xFF) for i in range(4))
+    log(f"Cámara {indice}: {int(captura.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
+        f"{int(captura.get(cv2.CAP_PROP_FRAME_HEIGHT))}, formato "
+        f"{formato.strip() or '?'}, {captura.get(cv2.CAP_PROP_FPS):.0f} FPS "
+        f"nominales, backend {captura.getBackendName()}.")
+    return captura
+
+
+class CapturaEnHilo:
+    """Lee la cámara en un hilo propio y se queda solo con el último cuadro.
+
+    Uso:
+        camara = CapturaEnHilo(captura)
+        numero, frame, momento = camara.esperar_cuadro_nuevo(numero_anterior)
+        ...
+        camara.detener()
+
+    Cada cuadro tiene un 'numero' que va en aumento, para saber si es nuevo,
+    y el 'momento' (time.time()) en que se capturó."""
+
+    # Si la cámara no entrega ningún cuadro durante este tiempo, se considera
+    # perdida (desconectada).
+    SEGUNDOS_SIN_CUADROS_PERDIDA = 5.0
+
+    def __init__(self, captura):
+        self._captura = captura
+        self._condicion = threading.Condition()
+        self._frame = None
+        self._numero = 0
+        self._momento = 0.0
+        self._activa = True
+        self.perdida = False
+        self.cuadros_leidos = 0   # contador total, para calcular FPS de captura
+        self._hilo = threading.Thread(target=self._leer_sin_parar, daemon=True)
+        self._hilo.start()
+
+    def _leer_sin_parar(self):
+        ultimo_ok = time.time()
+        while self._activa:
+            ok, frame = self._captura.read()
+            ahora = time.time()
+            if not ok:
+                if ahora - ultimo_ok > self.SEGUNDOS_SIN_CUADROS_PERDIDA:
+                    with self._condicion:
+                        self.perdida = True
+                        self._condicion.notify_all()
+                    return
+                time.sleep(0.01)
+                continue
+            ultimo_ok = ahora
+            with self._condicion:
+                # Pisamos el cuadro anterior: si nadie lo procesó, se pierde.
+                # Es justamente lo que queremos.
+                self._frame = frame
+                self._numero += 1
+                self._momento = ahora
+                self.cuadros_leidos += 1
+                self._condicion.notify_all()
+
+    def esperar_cuadro_nuevo(self, numero_anterior, numero_minimo=None,
+                             timeout=1.0):
+        """Espera hasta que haya un cuadro con número > 'numero_anterior'
+        (o >= 'numero_minimo', si se indica) y devuelve (numero, frame,
+        momento). Devuelve (None, None, None) si pasó 'timeout' sin cuadros
+        nuevos o si la cámara se perdió (mirar el atributo 'perdida')."""
+        if numero_minimo is None:
+            numero_minimo = numero_anterior + 1
+        with self._condicion:
+            hay_nuevo = self._condicion.wait_for(
+                lambda: self._numero >= numero_minimo or self.perdida
+                or not self._activa,
+                timeout=timeout)
+            if not hay_nuevo or self.perdida or not self._activa:
+                return None, None, None
+            return self._numero, self._frame, self._momento
+
+    def detener(self):
+        """Frena el hilo y libera la cámara."""
+        self._activa = False
+        with self._condicion:
+            self._condicion.notify_all()
+        self._hilo.join(timeout=2.0)
+        self._captura.release()
+
+
+def revisar_alimentacion_pi():
+    """En la Raspberry Pi, pregunta al firmware (vcgencmd get_throttled) si
+    hubo bajo voltaje o exceso de temperatura. Las dos cosas hacen que la Pi
+    baje su velocidad a propósito ("throttling") y el detector vaya lento.
+    Si el comando no existe, no hace nada."""
+    if not es_raspberry_pi():
+        return
+    try:
+        salida = subprocess.run(["vcgencmd", "get_throttled"],
+                                capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return
+    texto = salida.stdout.strip()          # por ejemplo "throttled=0x50005"
+    if "=" not in texto:
+        return
+    valor_texto = texto.split("=", 1)[1]
+    try:
+        valor = int(valor_texto, 16)
+    except ValueError:
+        return
+    if valor == 0:
+        log("Alimentación y temperatura de la Pi: OK (throttled=0x0).")
+        return
+
+    # Significado de cada bit (documentación oficial de Raspberry Pi):
+    # los bits 0-3 son lo que pasa AHORA; los 16-19, lo que pasó desde que
+    # se prendió la Pi.
+    problemas = {
+        0: "bajo voltaje AHORA (fuente insuficiente o cable malo)",
+        1: "frecuencia de la CPU limitada AHORA",
+        2: "la Pi está frenada (throttled) AHORA",
+        3: "límite de temperatura AHORA",
+        16: "hubo bajo voltaje desde que se prendió",
+        17: "hubo frecuencia limitada desde que se prendió",
+        18: "estuvo frenada desde que se prendió",
+        19: "llegó al límite de temperatura desde que se prendió",
+    }
+    log(f"ADVERTENCIA: vcgencmd get_throttled = {valor_texto} (debería ser 0x0).")
+    for bit, descripcion in problemas.items():
+        if valor & (1 << bit):
+            print(f"  - {descripcion}")
+    print("  Usá la fuente oficial (5 V / 3 A en la Pi 4, 2,5 A en la Pi 3) y "
+          "un disipador o ventilador: si no, el detector va a ir más lento.")
+
+
+# ==============================================================================
 # BUCLE PRINCIPAL
 # ==============================================================================
 
@@ -1308,7 +1501,27 @@ def leer_argumentos():
         "--sin-ventana", action="store_true",
         help="no abre la ventana de video (para usar por SSH o sin monitor). "
              "Salís con Ctrl+C.")
-    return parser.parse_args()
+    parser.add_argument(
+        "--ancho", type=int, default=None,
+        help="ancho de la imagen pedida a la cámara, en píxeles "
+             "(por defecto 640 en la Raspberry Pi; en la PC, el de la cámara).")
+    parser.add_argument(
+        "--alto", type=int, default=None,
+        help="alto de la imagen pedida a la cámara, en píxeles "
+             "(por defecto 480 en la Raspberry Pi; en la PC, el de la cámara).")
+    parser.add_argument(
+        "--saltar", type=int, default=1, metavar="N",
+        help="procesar 1 de cada N cuadros de la cámara (por defecto 1 = "
+             "todos). Sirve si la máquina no da abasto. Los tiempos de "
+             "detección siguen medidos en segundos, no en cuadros.")
+    argumentos = parser.parse_args()
+    if argumentos.saltar < 1:
+        parser.error("--saltar tiene que ser 1 o más.")
+    if (argumentos.ancho is None) != (argumentos.alto is None):
+        parser.error("--ancho y --alto se usan juntos.")
+    if argumentos.ancho is None and es_raspberry_pi():
+        argumentos.ancho, argumentos.alto = 640, 480
+    return argumentos
 
 
 def hay_pantalla():
@@ -1355,6 +1568,9 @@ def main():
             raise KeyboardInterrupt
         signal.signal(signal.SIGTERM, _al_terminar)
 
+    # En la Pi, avisar de entrada si la fuente o la temperatura la frenan.
+    revisar_alimentacion_pi()
+
     # --- Preparamos el detector facial de MediaPipe ---
     detector_facial = crear_detector_facial()
 
@@ -1362,9 +1578,9 @@ def main():
     detector_cabeceos = DetectorCabeceos()
 
     # --- Abrimos la webcam ---
-    captura = cv2.VideoCapture(CAMARA_INDICE)
+    captura = abrir_camara(CAMARA_INDICE, argumentos.ancho, argumentos.alto)
 
-    if not captura.isOpened():
+    if captura is None:
         # Si no se pudo abrir la cámara (no hay cámara, está siendo usada
         # por otro programa, permisos de Windows bloqueados, etc.), avisamos
         # con un mensaje claro y cortamos el programa en vez de romper con
@@ -1409,6 +1625,18 @@ def main():
     # ninguna medición de la lógica de detección.
     contador_timestamp_ms = 0
 
+    # Desde acá la cámara se lee en su propio hilo (ver CapturaEnHilo): el
+    # bucle siempre toma el cuadro más reciente y nunca uno atrasado.
+    camara = CapturaEnHilo(captura)
+    numero_procesado = 0   # número del último cuadro que procesamos
+
+    # Estadísticas de rendimiento, que se imprimen cada 5 segundos.
+    SEGUNDOS_ENTRE_ESTADISTICAS = 5.0
+    momento_estadisticas = time.time()
+    leidos_antes = 0
+    procesados = 0
+    tiempo_procesando = 0.0
+
     # En modo sin ventana, los comandos se escriben en la consola.
     comandos = queue.Queue()
     if not mostrar_ventana and sys.stdin is not None and sys.stdin.isatty():
@@ -1427,19 +1655,26 @@ def main():
 
     try:
         while True:
-            # Leemos un frame (una imagen) de la cámara. Este 'frame_crudo'
-            # NO se espeja: toda la detección (MediaPipe, EAR, pose) trabaja
-            # sobre él.
-            ret, frame_crudo = captura.read()
-            if not ret:
-                # 'ret' es False si por algún motivo no se pudo leer un frame
-                # (por ejemplo, la cámara se desconectó a mitad de la
-                # ejecución).
-                log("ERROR: se perdió la conexión con la cámara.")
-                break
-
-            # Momento actual, en segundos. TODA la lógica temporal usa esto.
-            ahora = time.time()
+            # Tomamos el cuadro MÁS RECIENTE de la cámara (esperando si
+            # todavía no llegó uno nuevo). Con --saltar N se espera a que la
+            # cámara haya entregado N cuadros desde el último procesado.
+            # Este 'frame_crudo' NO se espeja: toda la detección (MediaPipe,
+            # EAR, pose) trabaja sobre él.
+            #
+            # 'ahora' es el momento en que la cámara capturó el cuadro, en
+            # segundos (time.time()). TODA la lógica temporal usa esto.
+            numero, frame_crudo, ahora = camara.esperar_cuadro_nuevo(
+                numero_procesado,
+                numero_minimo=numero_procesado + argumentos.saltar)
+            if numero is None:
+                if camara.perdida:
+                    # La cámara dejó de entregar cuadros (por ejemplo, se
+                    # desconectó a mitad de la ejecución).
+                    log("ERROR: se perdió la conexión con la cámara.")
+                    break
+                continue  # todavía no llegó un cuadro nuevo; seguimos esperando
+            numero_procesado = numero
+            inicio_proceso = time.time()
 
             contador_timestamp_ms += 1
             ear_promedio, pose, puntos_ojo_izq, puntos_ojo_der = procesar_frame(
@@ -1551,6 +1786,24 @@ def main():
                 else:
                     momento_alerta_cabeceo = None
 
+            # --- Rendimiento: FPS de captura y de procesamiento ---
+            procesados += 1
+            tiempo_procesando += time.time() - inicio_proceso
+            transcurrido = time.time() - momento_estadisticas
+            if transcurrido >= SEGUNDOS_ENTRE_ESTADISTICAS:
+                leidos = camara.cuadros_leidos
+                fps_captura = (leidos - leidos_antes) / transcurrido
+                fps_proceso = procesados / transcurrido
+                ms_por_cuadro = 1000.0 * tiempo_procesando / procesados
+                atraso_ms = 1000.0 * (time.time() - ahora)
+                log(f"FPS captura: {fps_captura:.1f} | FPS procesamiento: "
+                    f"{fps_proceso:.1f} | {ms_por_cuadro:.0f} ms por cuadro | "
+                    f"atraso del último cuadro: {atraso_ms:.0f} ms")
+                momento_estadisticas = time.time()
+                leidos_antes = leidos
+                procesados = 0
+                tiempo_procesando = 0.0
+
             # --- Teclas / comandos ---
             tecla = None
             if mostrar_ventana:
@@ -1594,7 +1847,7 @@ def main():
         # no van a poder usarla. Esto se hace SIEMPRE, se salga como se
         # salga (q, Ctrl+C o un error).
         alarma.cerrar()  # en la Pi, deja el buzzer apagado sí o sí
-        captura.release()
+        camara.detener()  # frena el hilo de captura y libera la cámara
         if mostrar_ventana:
             cv2.destroyAllWindows()
         detector_facial.close()
