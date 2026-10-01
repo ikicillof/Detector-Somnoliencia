@@ -1636,6 +1636,12 @@ def main():
     leidos_antes = 0
     procesados = 0
     tiempo_procesando = 0.0
+    # Mínimos de la ventana de 5 s, para ajustar los umbrales desde la
+    # consola: un parpadeo o una cabeceada duran menos de 5 s, así que el
+    # valor "actual" solo no alcanza para verlos.
+    ear_minimo = None
+    desv_minima = None
+    vel_minima = None
 
     # En modo sin ventana, los comandos se escriben en la consola.
     comandos = queue.Queue()
@@ -1786,6 +1792,16 @@ def main():
                 else:
                     momento_alerta_cabeceo = None
 
+            # --- Valores en vivo para la consola (mínimos de la ventana) ---
+            if ear_promedio is not None:
+                ear_minimo = (ear_promedio if ear_minimo is None
+                              else min(ear_minimo, ear_promedio))
+            if pose is not None and not detector_cabeceos.calibrando:
+                desv = detector_cabeceos.desviacion
+                vel = detector_cabeceos.ultima_velocidad
+                desv_minima = desv if desv_minima is None else min(desv_minima, desv)
+                vel_minima = vel if vel_minima is None else min(vel_minima, vel)
+
             # --- Rendimiento: FPS de captura y de procesamiento ---
             procesados += 1
             tiempo_procesando += time.time() - inicio_proceso
@@ -1799,6 +1815,27 @@ def main():
                 log(f"FPS captura: {fps_captura:.1f} | FPS procesamiento: "
                     f"{fps_proceso:.1f} | {ms_por_cuadro:.0f} ms por cuadro | "
                     f"atraso del último cuadro: {atraso_ms:.0f} ms")
+                # Segunda línea: valores de detección (actual y mínimo de
+                # estos 5 s) para comparar con los umbrales sin ventana.
+                if ear_promedio is not None:
+                    texto_ear = f"EAR {ear_promedio:.3f}"
+                else:
+                    texto_ear = "EAR --"
+                if ear_minimo is not None:
+                    texto_ear += f" (mín {ear_minimo:.3f}, umbral {EAR_THRESHOLD:.2f})"
+                if detector_cabeceos.calibrando:
+                    texto_pose = "pose: calibrando..."
+                elif desv_minima is None:
+                    texto_pose = "pose: --"
+                else:
+                    texto_pose = (
+                        f"desv {detector_cabeceos.desviacion:+.1f}° (mín "
+                        f"{desv_minima:+.1f}°, umbral {-CABEZA_CAIDA_GRADOS:+.1f}°) | "
+                        f"vel {detector_cabeceos.ultima_velocidad:+.0f}°/s (mín "
+                        f"{vel_minima:+.0f}°/s, umbral "
+                        f"{-CABECEO_VELOCIDAD_GRADOS_POR_SEG:+.0f}°/s)")
+                log(f"  {texto_ear} | {texto_pose}")
+                ear_minimo = desv_minima = vel_minima = None
                 momento_estadisticas = time.time()
                 leidos_antes = leidos
                 procesados = 0
