@@ -124,6 +124,9 @@
 import os
 import sys
 import time
+import argparse   # Para leer opciones de la línea de comandos (--sin-ventana).
+import queue      # Cola segura entre hilos (comandos escritos en la consola).
+import signal     # Para cerrar ordenadamente si el sistema pide terminar.
 import platform   # Para saber en qué sistema operativo estamos (Windows,
                   # Linux...) y elegir cómo hacer sonar la alarma.
 import threading
@@ -1292,8 +1295,68 @@ def dibujar_hud(frame, ear_promedio, segundos_ojos_cerrados, detector_cabeceos):
 # BUCLE PRINCIPAL
 # ==============================================================================
 
+def log(mensaje):
+    """Imprime un evento en la consola con la hora adelante. En modo sin
+    ventana la consola es la única forma de ver qué está pasando."""
+    print(f"[{time.strftime('%H:%M:%S')}] {mensaje}", flush=True)
+
+
+def leer_argumentos():
+    """Lee las opciones de la línea de comandos. Ejemplo:
+        python detector_somnoliencia.py --sin-ventana"""
+    parser = argparse.ArgumentParser(
+        description="Detector de somnolencia por cámara (ojos y cabeceos).")
+    parser.add_argument(
+        "--sin-ventana", action="store_true",
+        help="no abre la ventana de video (para usar por SSH o sin monitor). "
+             "Salís con Ctrl+C.")
+    return parser.parse_args()
+
+
+def hay_pantalla():
+    """False si estamos en Linux sin entorno gráfico (por ejemplo, conectados
+    por SSH a la Raspberry Pi). Ahí cv2.imshow aborta el programa con
+    'qt.qpa.xcb: could not connect to display', así que hay que evitarlo.
+    En Windows y macOS siempre hay pantalla."""
+    if platform.system() != "Linux":
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def escuchar_teclado(comandos):
+    """Corre en un hilo aparte en modo sin ventana: lee líneas de la consola
+    y las deja en la cola 'comandos'. Así se puede recalibrar escribiendo 'c'
+    + Enter (y salir con 'q' + Enter, además de Ctrl+C), aunque no haya
+    ventana donde apretar teclas."""
+    while True:
+        try:
+            linea = sys.stdin.readline()
+        except (OSError, ValueError):
+            return
+        if not linea:  # se cerró la entrada (por ejemplo, corre como servicio)
+            return
+        comandos.put(linea.strip().lower())
+
+
 def main():
     """Función principal: abre la cámara y corre el bucle de detección."""
+    argumentos = leer_argumentos()
+
+    # --- ¿Con o sin ventana? ---
+    mostrar_ventana = not argumentos.sin_ventana
+    if mostrar_ventana and not hay_pantalla():
+        mostrar_ventana = False
+        log("No hay pantalla (no existe DISPLAY ni WAYLAND_DISPLAY): se activa "
+            "automáticamente el modo --sin-ventana.")
+
+    # En Linux, si alguien manda la señal de terminar (por ejemplo, 'kill' o
+    # al detener un servicio), la tratamos igual que Ctrl+C para cerrar
+    # ordenadamente y no dejar el buzzer sonando.
+    if platform.system() == "Linux":
+        def _al_terminar(_senal, _marco):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, _al_terminar)
+
     # --- Preparamos el detector facial de MediaPipe ---
     detector_facial = crear_detector_facial()
 
@@ -1313,6 +1376,7 @@ def main():
         print("otra aplicación, y que el sistema tenga permitido el acceso a")
         print("la cámara. Si tenés varias cámaras, probá otro valor en la")
         print("constante CAMARA_INDICE.")
+        detector_facial.close()
         return
 
     # Momento en que empezó la racha actual de "ojos cerrados" (None si los
@@ -1335,130 +1399,206 @@ def main():
     # segundos porque el cabeceo es un evento instantáneo.
     momento_alerta_cabeceo = None
 
+    # Estado anterior de cada alerta, para imprimir en consola solo cuando
+    # EMPIEZA o TERMINA (y no una línea por cada frame).
+    alerta_ojos_antes = False
+    alerta_cabeza_antes = False
+    hay_rostro_antes = None
+    calibrando_antes = True
+
     # Contador que le pasamos a MediaPipe como "marca de tiempo" de cada
     # frame. Solo sirve para que MediaPipe ordene los cuadros; no se usa para
     # ninguna medición de la lógica de detección.
     contador_timestamp_ms = 0
 
-    print("Detector de somnolencia iniciado.")
-    print(f"Calibrando la pose de la cabeza durante {CALIBRACION_SEGUNDOS:.0f} "
-          f"segundos: mirá al frente y quedate quieto.")
-    print("Presioná 'q' para salir, 'c' para volver a calibrar la pose.")
+    # En modo sin ventana, los comandos se escriben en la consola.
+    comandos = queue.Queue()
+    if not mostrar_ventana and sys.stdin is not None and sys.stdin.isatty():
+        threading.Thread(target=escuchar_teclado, args=(comandos,),
+                         daemon=True).start()
 
-    while True:
-        # Leemos un frame (una imagen) de la cámara. Este 'frame_crudo' NO se
-        # espeja: toda la detección (MediaPipe, EAR, pose) trabaja sobre él.
-        ret, frame_crudo = captura.read()
-        if not ret:
-            # 'ret' es False si por algún motivo no se pudo leer un frame
-            # (por ejemplo, la cámara se desconectó a mitad de la ejecución).
-            print("ERROR: se perdió la conexión con la cámara.")
-            break
+    log("Detector de somnolencia iniciado"
+        + (" (modo sin ventana)." if not mostrar_ventana else "."))
+    log(f"Calibrando la pose de la cabeza durante {CALIBRACION_SEGUNDOS:.0f} "
+        f"segundos: mirá al frente y quedate quieto.")
+    if mostrar_ventana:
+        print("Presioná 'q' para salir, 'c' para volver a calibrar la pose.")
+    else:
+        print("Escribí 'c' + Enter para volver a calibrar la pose. "
+              "Ctrl+C (o 'q' + Enter) para salir.")
 
-        # Momento actual, en segundos. TODA la lógica temporal usa esto.
-        ahora = time.time()
+    try:
+        while True:
+            # Leemos un frame (una imagen) de la cámara. Este 'frame_crudo'
+            # NO se espeja: toda la detección (MediaPipe, EAR, pose) trabaja
+            # sobre él.
+            ret, frame_crudo = captura.read()
+            if not ret:
+                # 'ret' es False si por algún motivo no se pudo leer un frame
+                # (por ejemplo, la cámara se desconectó a mitad de la
+                # ejecución).
+                log("ERROR: se perdió la conexión con la cámara.")
+                break
 
-        contador_timestamp_ms += 1
-        ear_promedio, pose, puntos_ojo_izq, puntos_ojo_der = procesar_frame(
-            frame_crudo, detector_facial, contador_timestamp_ms
-        )
+            # Momento actual, en segundos. TODA la lógica temporal usa esto.
+            ahora = time.time()
 
-        # A partir de acá trabajamos sobre 'lienzo': la copia ESPEJADA que se
-        # muestra en pantalla (efecto espejo, más natural para mirarse). Es
-        # solo visual; la detección ya se hizo sobre el frame crudo.
-        lienzo = cv2.flip(frame_crudo, 1)
-        ancho_lienzo = lienzo.shape[1]
+            contador_timestamp_ms += 1
+            ear_promedio, pose, puntos_ojo_izq, puntos_ojo_der = procesar_frame(
+                frame_crudo, detector_facial, contador_timestamp_ms
+            )
 
-        # ==================================================================
-        # SEÑAL 1: OJOS CERRADOS (EAR)
-        # ==================================================================
-        if ear_promedio is None:
-            # No se detectó ninguna cara. Cortamos la racha de ojos cerrados
-            # para no arrastrar una que en realidad es "la cara salió de
-            # cuadro", y avisamos en pantalla.
-            tiempo_ojos_cerrados_inicio = None
-            segundos_ojos_cerrados = 0.0
-            ojos_cerrados_estado = False
-            cv2.putText(lienzo, "No se detecta rostro", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
-        else:
-            # Dibujamos los puntos de cada ojo (con la x espejada, porque los
-            # puntos vienen en coordenadas del frame crudo y el lienzo está
-            # espejado).
-            for (x, y) in puntos_ojo_izq + puntos_ojo_der:
-                cv2.circle(lienzo, (ancho_lienzo - 1 - x, y), 2, (0, 255, 0), -1)
+            # A partir de acá dibujamos sobre 'lienzo': la copia ESPEJADA que
+            # se muestra en pantalla (efecto espejo, más natural para
+            # mirarse). Es solo visual; la detección ya se hizo sobre el
+            # frame crudo. Sin ventana no hay nada que dibujar: 'lienzo'
+            # queda en None y nos ahorramos ese trabajo.
+            lienzo = cv2.flip(frame_crudo, 1) if mostrar_ventana else None
 
-            # Histéresis: entrar en "ojos cerrados" con EAR < umbral, salir
-            # recién cuando el EAR supera umbral + EAR_HISTERESIS.
-            if not ojos_cerrados_estado and ear_promedio < EAR_THRESHOLD:
-                ojos_cerrados_estado = True
-            elif ojos_cerrados_estado and ear_promedio > EAR_THRESHOLD + EAR_HISTERESIS:
-                ojos_cerrados_estado = False
+            hay_rostro = ear_promedio is not None
+            if hay_rostro != hay_rostro_antes:
+                log("Rostro detectado." if hay_rostro else "No se detecta rostro.")
+                hay_rostro_antes = hay_rostro
 
-            if ojos_cerrados_estado:
-                # Si es el comienzo de la racha anotamos el momento; si ya
-                # venía, medimos cuánto lleva (con el reloj, no con frames).
-                if tiempo_ojos_cerrados_inicio is None:
-                    tiempo_ojos_cerrados_inicio = ahora
-                segundos_ojos_cerrados = ahora - tiempo_ojos_cerrados_inicio
-            else:
+            # ==============================================================
+            # SEÑAL 1: OJOS CERRADOS (EAR)
+            # ==============================================================
+            alerta_ojos = False
+            if ear_promedio is None:
+                # No se detectó ninguna cara. Cortamos la racha de ojos
+                # cerrados para no arrastrar una que en realidad es "la cara
+                # salió de cuadro", y avisamos en pantalla.
                 tiempo_ojos_cerrados_inicio = None
                 segundos_ojos_cerrados = 0.0
-
-            if segundos_ojos_cerrados >= DROWSY_TIME_SECONDS:
-                dibujar_alerta_ojos(lienzo)
-                alarma.disparar(NIVEL_PELIGRO)
-
-        # ==================================================================
-        # SEÑAL 2: CABECEOS (POSE DE LA CABEZA)
-        # ==================================================================
-        # Independiente de los ojos: se calcula siempre que haya una pose
-        # válida, aunque el EAR de ese frame haya fallado.
-        if pose is not None:
-            cabeza_caida, cabeceo_brusco = detector_cabeceos.procesar(pose, ahora)
-
-            if cabeza_caida:
-                dibujar_alerta_cabeza_caida(lienzo)
-                alarma.disparar(NIVEL_PELIGRO)
-
-            if cabeceo_brusco:
-                print("ALERTA: cabeceo brusco detectado.")
-                momento_alerta_cabeceo = ahora
-                alarma.disparar(NIVEL_AVISO)
-
-        # Mantenemos el cartel de cabeceo unos segundos después del evento.
-        if momento_alerta_cabeceo is not None:
-            if (ahora - momento_alerta_cabeceo) < DURACION_ALERTA_CABECEO_SEG:
-                dibujar_alerta_cabeceo(lienzo)
+                ojos_cerrados_estado = False
+                if lienzo is not None:
+                    cv2.putText(lienzo, "No se detecta rostro", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2,
+                                cv2.LINE_AA)
             else:
-                momento_alerta_cabeceo = None
+                # Dibujamos los puntos de cada ojo (con la x espejada, porque
+                # los puntos vienen en coordenadas del frame crudo y el lienzo
+                # está espejado).
+                if lienzo is not None:
+                    ancho_lienzo = lienzo.shape[1]
+                    for (x, y) in puntos_ojo_izq + puntos_ojo_der:
+                        cv2.circle(lienzo, (ancho_lienzo - 1 - x, y), 2,
+                                   (0, 255, 0), -1)
 
-        # Info en vivo para calibrar (EAR y pitch en pantalla).
-        dibujar_hud(lienzo, ear_promedio, segundos_ojos_cerrados, detector_cabeceos)
+                # Histéresis: entrar en "ojos cerrados" con EAR < umbral,
+                # salir recién cuando el EAR supera umbral + EAR_HISTERESIS.
+                if not ojos_cerrados_estado and ear_promedio < EAR_THRESHOLD:
+                    ojos_cerrados_estado = True
+                elif ojos_cerrados_estado and ear_promedio > EAR_THRESHOLD + EAR_HISTERESIS:
+                    ojos_cerrados_estado = False
 
-        # Mostramos el lienzo (imagen espejada) en una ventana.
-        cv2.imshow("Detector de Somnolencia", lienzo)
+                if ojos_cerrados_estado:
+                    # Si es el comienzo de la racha anotamos el momento; si ya
+                    # venía, medimos cuánto lleva (con el reloj, no con
+                    # frames).
+                    if tiempo_ojos_cerrados_inicio is None:
+                        tiempo_ojos_cerrados_inicio = ahora
+                    segundos_ojos_cerrados = ahora - tiempo_ojos_cerrados_inicio
+                else:
+                    tiempo_ojos_cerrados_inicio = None
+                    segundos_ojos_cerrados = 0.0
 
-        # Esperamos 1 milisegundo a que se presione una tecla. El '& 0xFF' es
-        # una forma estándar de comparar la tecla en distintos sistemas
-        # operativos.
-        tecla = cv2.waitKey(1) & 0xFF
-        if tecla == ord('q'):
-            print("Saliendo del programa...")
-            break
-        if tecla == ord('c'):
-            detector_cabeceos.recalibrar()
-            print("Recalibrando la pose de la cabeza: mirá al frente y "
-                  "quedate quieto.")
+                if segundos_ojos_cerrados >= DROWSY_TIME_SECONDS:
+                    alerta_ojos = True
+                    if lienzo is not None:
+                        dibujar_alerta_ojos(lienzo)
+                    alarma.disparar(NIVEL_PELIGRO)
 
-    # --- Liberamos los recursos antes de terminar ---
-    # Muy importante: si no liberamos la cámara, puede quedar "ocupada" y
-    # otras aplicaciones (o el propio programa, si lo volvés a correr) no
-    # van a poder usarla hasta reiniciar la computadora.
-    captura.release()
-    cv2.destroyAllWindows()
-    detector_facial.close()
-    alarma.cerrar()  # en la Pi, deja el buzzer apagado sí o sí
+            if alerta_ojos != alerta_ojos_antes:
+                log("ALERTA: OJOS CERRADOS." if alerta_ojos
+                    else "Fin de alerta: ojos abiertos.")
+                alerta_ojos_antes = alerta_ojos
+
+            # ==============================================================
+            # SEÑAL 2: CABECEOS (POSE DE LA CABEZA)
+            # ==============================================================
+            # Independiente de los ojos: se calcula siempre que haya una pose
+            # válida, aunque el EAR de ese frame haya fallado.
+            alerta_cabeza = False
+            if pose is not None:
+                cabeza_caida, cabeceo_brusco = detector_cabeceos.procesar(pose, ahora)
+
+                if cabeza_caida:
+                    alerta_cabeza = True
+                    if lienzo is not None:
+                        dibujar_alerta_cabeza_caida(lienzo)
+                    alarma.disparar(NIVEL_PELIGRO)
+
+                if cabeceo_brusco:
+                    log("ALERTA: cabeceo brusco detectado.")
+                    momento_alerta_cabeceo = ahora
+                    alarma.disparar(NIVEL_AVISO)
+
+            if alerta_cabeza != alerta_cabeza_antes:
+                log("ALERTA: CABEZA CAIDA." if alerta_cabeza
+                    else "Fin de alerta: cabeza levantada.")
+                alerta_cabeza_antes = alerta_cabeza
+
+            # La calibración imprime su propio resultado; acá solo marcamos
+            # cuándo se termina, con hora, para seguirlo en la consola.
+            if calibrando_antes and not detector_cabeceos.calibrando:
+                log("Calibración terminada: detección de cabeceos activa.")
+            calibrando_antes = detector_cabeceos.calibrando
+
+            # Mantenemos el cartel de cabeceo unos segundos después del evento.
+            if momento_alerta_cabeceo is not None:
+                if (ahora - momento_alerta_cabeceo) < DURACION_ALERTA_CABECEO_SEG:
+                    if lienzo is not None:
+                        dibujar_alerta_cabeceo(lienzo)
+                else:
+                    momento_alerta_cabeceo = None
+
+            # --- Teclas / comandos ---
+            tecla = None
+            if mostrar_ventana:
+                # Info en vivo para calibrar (EAR y pitch en pantalla).
+                dibujar_hud(lienzo, ear_promedio, segundos_ojos_cerrados,
+                            detector_cabeceos)
+                # Mostramos el lienzo (imagen espejada) en una ventana.
+                cv2.imshow("Detector de Somnolencia", lienzo)
+                # Esperamos 1 milisegundo a que se presione una tecla. El
+                # '& 0xFF' es una forma estándar de comparar la tecla en
+                # distintos sistemas operativos.
+                codigo = cv2.waitKey(1) & 0xFF
+                if codigo != 0xFF:
+                    tecla = chr(codigo)
+            else:
+                try:
+                    tecla = comandos.get_nowait()
+                except queue.Empty:
+                    pass
+
+            if tecla == "q":
+                log("Saliendo del programa...")
+                break
+            if tecla == "c":
+                detector_cabeceos.recalibrar()
+                calibrando_antes = True
+                log("Recalibrando la pose de la cabeza: mirá al frente y "
+                    "quedate quieto.")
+
+    except KeyboardInterrupt:
+        # Ctrl+C: no es un error, es la forma normal de salir sin ventana.
+        print()
+        log("Ctrl+C: saliendo del programa...")
+
+    finally:
+        # --- Liberamos los recursos antes de terminar ---
+        # Muy importante: si no liberamos la cámara, puede quedar "ocupada"
+        # y otras aplicaciones (o el propio programa, si lo volvés a correr)
+        # no van a poder usarla. Esto se hace SIEMPRE, se salga como se
+        # salga (q, Ctrl+C o un error).
+        alarma.cerrar()  # en la Pi, deja el buzzer apagado sí o sí
+        captura.release()
+        if mostrar_ventana:
+            cv2.destroyAllWindows()
+        detector_facial.close()
+        log("Recursos liberados. Chau.")
 
 
 # Este bloque hace que 'main()' se ejecute solo cuando corrés este archivo
