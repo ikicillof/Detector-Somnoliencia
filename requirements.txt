@@ -1,7 +1,20 @@
-# mediapipe ya instala su propia versión de OpenCV (opencv-contrib-python)
-# como dependencia. No agregamos "opencv-python" por separado porque tener
-# opencv-python Y opencv-contrib-python instalados al mismo tiempo genera
-# conflictos (ambos paquetes proveen el módulo "cv2" y pueden pisarse entre
-# sí, provocando errores difíciles de diagnosticar).
+# Dependencias para PC / Windows (en la Raspberry Pi se usa
+# requirements-pi.txt + instalar_pi.sh; ver INSTALACION_PI.md).
+#
+#   pip install -r requirements.txt
+
+# Detección de los puntos de la cara.
 mediapipe>=0.10,<2.0
+
+# OpenCV: cámara, ventana, dibujo y solvePnP. Va EXPLÍCITO (antes llegaba
+# solo como dependencia de mediapipe). Usamos la variante "contrib", la misma
+# que pide mediapipe: NO agregar también "opencv-python", porque los dos
+# paquetes proveen el módulo "cv2" y se pisan entre sí.
+opencv-contrib-python
+
+# Cálculos numéricos (EAR, pose) y generación del tono de la alarma.
 numpy>=1.26
+
+# Alarma por los parlantes de la PC. Si no se instala, el programa sigue
+# funcionando con la alarma solo visual.
+sounddevice

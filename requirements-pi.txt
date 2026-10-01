@@ -1,0 +1,32 @@
+# Dependencias para la Raspberry Pi (3 o 4) con Python 3.11.
+# NO instalar a mano: usá ./instalar_pi.sh, que instala esto y después
+# mediapipe por separado.
+#
+# ¿POR QUÉ MEDIAPIPE NO ESTÁ EN ESTA LISTA?
+# - mediapipe 1.0.x (la única con wheels para Python 3.13) está compilada
+#   con instrucciones AES de ARMv8 que la Pi 3/4 no tiene: muere con
+#   "FATAL ERROR: This binary was compiled with aes enabled...". Por eso
+#   usamos Python 3.11 y mediapipe==0.10.18.
+# - mediapipe 0.10.18 declara como dependencias jax, jaxlib y scipy, que
+#   pesan cientos de MB, llenan /tmp (que en la Pi está en RAM) y la SD, y
+#   no se usan para la detección facial. Por eso instalar_pi.sh la instala
+#   con --no-deps, y acá abajo están, a mano, las dependencias que SÍ hacen
+#   falta.
+# NUNCA agregar jax, jaxlib ni scipy a esta lista.
+
+# mediapipe 0.10.18 necesita numpy 1.x, y OpenCV 4.11+ exige numpy 2.
+numpy<2
+opencv-contrib-python<4.11
+
+# Dependencias de mediapipe 0.10.18 (sin jax/jaxlib/scipy).
+absl-py
+attrs
+flatbuffers
+matplotlib
+protobuf>=4.25.3,<5
+sentencepiece
+
+# Alarma: sonido por parlantes (si los hay) y buzzer por GPIO.
+sounddevice
+gpiozero
+lgpio

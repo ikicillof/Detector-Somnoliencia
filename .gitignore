@@ -1,4 +1,14 @@
+# Entorno virtual de Python
+venv/
+.venv/
+
+# Archivos compilados de Python
 __pycache__/
 *.pyc
-venv/
+
+# Modelos de MediaPipe descargados automáticamente
 face_landmarker.task
+*.task
+
+# Carpeta temporal de la instalación en la Pi
+tmp/
