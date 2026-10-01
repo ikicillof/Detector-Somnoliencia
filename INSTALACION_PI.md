@@ -100,8 +100,10 @@ python detector_somnoliencia.py --sin-ventana
 - `source venv/bin/activate` "entra" al entorno virtual. Hay que hacerlo
   **cada vez** que abrís una terminal nueva. Te das cuenta de que está
   activo porque el renglón empieza con `(venv)`.
-- Al arrancar se **calibra solo**: mirá al frente y quedate quieto unos
-  segundos. Si te movés, reintenta solo hasta que salga bien. Cuando
+- Al arrancar se **calibra solo**: mirá al frente, con los ojos abiertos
+  normalmente, y quedate quieto unos segundos. Se calibra la posición de la
+  cabeza y también el umbral de ojos cerrados de esa persona (así funciona
+  bien con ojos achinados). Si te movés, reintenta solo hasta que salga bien. Cuando
   termina, el buzzer hace un pitido muy cortito.
 - En la consola van apareciendo los eventos con la hora: calibración,
   rostro detectado/perdido y las alertas (`ALERTA: OJOS CERRADOS`,

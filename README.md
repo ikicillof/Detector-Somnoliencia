@@ -88,7 +88,8 @@ python detector_somnoliencia.py [--sin-ventana] [--ancho 640 --alto 480] [--salt
   desviación respecto del neutro, velocidad angular y el temporizador de
   cabeza caída. Esos números son los que se usan para calibrar los umbrales.
 - Al arrancar hay unos segundos de
-  **calibración**: mirá al frente y quedate quieto. Si te movés o no mirás
+  **calibración** (de la cabeza y del umbral de los ojos): mirá al frente,
+  con los ojos abiertos normalmente, y quedate quieto. Si te movés o no mirás
   de frente, la calibración se descarta y se reintenta sola, todas las veces
   que haga falta, sin tocar ninguna tecla. Mientras tanto la detección de
   ojos cerrados sigue funcionando.
@@ -109,9 +110,15 @@ cantidad de cuadros. Los principales:
 
 **Ojos:**
 
-- `EAR_THRESHOLD` (por defecto `0.18`): si dispara con los ojos abiertos,
-  bajalo (p. ej. `0.15`); si no detecta con los ojos cerrados, subilo
-  (p. ej. `0.22`).
+- El umbral de ojos cerrados **se calibra solo para cada persona** al
+  arrancar: se mide su EAR con los ojos abiertos y el umbral queda en
+  `EAR_FRACCION_UMBRAL` (por defecto `0.70`) de ese valor. Así funciona igual
+  con ojos grandes que con ojos achinados. Si dispara con los ojos abiertos,
+  bajá esa fracción (p. ej. `0.65`); si no detecta los ojos cerrados,
+  subila (p. ej. `0.75`). El umbral calibrado aparece en pantalla y en la
+  consola (`Ojos calibrados: ... -> umbral ...`).
+- `EAR_THRESHOLD` (por defecto `0.12`): umbral de respaldo que se usa solo
+  durante los primeros segundos, hasta que termina la calibración de los ojos.
 - `DROWSY_TIME_SECONDS` (por defecto `2.0`): segundos de ojos cerrados
   seguidos que cuentan como somnolencia.
 

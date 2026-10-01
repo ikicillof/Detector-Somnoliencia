@@ -81,11 +81,17 @@ En modo solo visual no imprime nada extra.
 Además, ahora un pedido de mayor prioridad corta al instante el patrón de
 menor prioridad que esté sonando, para que una alerta nunca espere.
 
-**Umbral de ojos:** `EAR_THRESHOLD` bajó de 0.22 a 0.18 (pedido explícito):
-a un compañero con ojos achinados lo marcaba como ojos cerrados con los ojos
-abiertos. Pendiente: verificar con su EAR real (valor en pantalla o en la
-línea de consola de cada 5 s) y evaluar un umbral que se calibre solo por
-persona.
+**Umbral de ojos:** a un compañero con ojos achinados lo marcaba como ojos
+cerrados con los ojos abiertos. Primero se bajó `EAR_THRESHOLD` de 0.22 a
+0.18; después (pedido explícito) el umbral pasó a **calibrarse solo por
+persona** (`CalibradorEAR`): durante `EAR_CALIBRACION_SEGUNDOS` se mide la
+mediana del EAR con ojos abiertos y el umbral queda en
+`EAR_FRACCION_UMBRAL = 0.70` de ese valor, limitado entre 0.12 y 0.26. Si la
+mediana da menos de `EAR_ABIERTO_MINIMO = 0.15` (ojos cerrados al calibrar)
+se reintenta sola. Mientras tanto se usa `EAR_THRESHOLD = 0.12` de respaldo,
+así la alarma de ojos funciona desde el primer segundo sin falsas alarmas
+con ojos achinados. La tecla `c` (sin ventana) recalibra también los ojos.
+Pendiente: probarlo con el compañero y ajustar `EAR_FRACCION_UMBRAL`.
 
 ### Cómo se probó
 
