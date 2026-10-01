@@ -50,7 +50,7 @@ detallados, en español, y los mensajes al usuario también son en español.
   `cv2.waitKey`, todos los eventos importantes se imprimen en consola, y
   Ctrl+C cierra limpio (cámara, buzzer, hilos).
 - **La alarma en la Pi es un buzzer activo por GPIO** (gpiozero con backend
-  lgpio), en `BUZZER_GPIO = 18` (pin físico 12) a través de un transistor.
+  lgpio), en `BUZZER_GPIO = 21` (pin físico 40) a través de un transistor.
   La alarma nunca bloquea el bucle de video ni corta el programa si falla.
 - La cámara se lee en un hilo aparte que guarda solo el último cuadro
   (`CapturaEnHilo`); no volver a leer la cámara directamente en el bucle.

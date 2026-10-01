@@ -319,11 +319,11 @@ ALARM_DURATION_MS = 700
 # Pin GPIO (numeración BCM, NO el número de pin físico) donde está conectada
 # la base del transistor que maneja el buzzer activo en la Raspberry Pi.
 # Conexión actual:
-#   pin físico 12 (GPIO18) -> resistencia de 1 kΩ -> base del transistor NPN
+#   pin físico 40 (GPIO21) -> resistencia de 1 kΩ -> base del transistor NPN
 #   pin físico 2 (5 V)     -> + del buzzer;  - del buzzer -> colector
 #   pin físico 14 (GND)    -> emisor
 # El GPIO en alto satura el transistor y el buzzer suena.
-BUZZER_GPIO = 18
+BUZZER_GPIO = 21
 
 # Patrones de pitidos de cada nivel de alerta, como lista de
 # (segundos_sonando, segundos_en_silencio). Así se distinguen de oído sin

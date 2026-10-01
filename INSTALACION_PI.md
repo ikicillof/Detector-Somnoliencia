@@ -7,7 +7,7 @@ nunca una Pi ni Linux.
 - **Placa:** Raspberry Pi 3 o 4, con Raspberry Pi OS Trixie de **64 bits**.
 - **Usuario:** `detector-somnoliencia`
 - **IP fija (Tailscale):** `100.66.6.49`
-- **Alarma:** buzzer activo en el **GPIO18** (pin físico 12), a través de un
+- **Alarma:** buzzer activo en el **GPIO21** (pin físico 40), a través de un
   transistor (ver [Conexión del buzzer](#5-conexión-del-buzzer)).
 
 ---
@@ -155,7 +155,7 @@ transistor NPN, porque el GPIO no da corriente suficiente:
 |---|---|
 | Pin 2 (5 V) | + del buzzer |
 | — | − del buzzer → colector del transistor |
-| Pin 12 (GPIO18) | resistencia de 1 kΩ → base del transistor |
+| Pin 40 (GPIO21) | resistencia de 1 kΩ → base del transistor |
 | Pin 14 (GND) | emisor del transistor |
 
 Si cambiás de pin, actualizá la constante `BUZZER_GPIO` al principio de
@@ -233,7 +233,7 @@ Si igual va lento, mirá la línea de FPS que sale cada 5 segundos y probá:
 
 ### El buzzer no suena
 
-- Al arrancar el programa tiene que decir `Alarma: usando buzzer GPIO18.`
+- Al arrancar el programa tiene que decir `Alarma: usando buzzer GPIO21.`
   Si dice `ADVERTENCIA: no se pudo usar el buzzer por GPIO`, el programa
   sigue pero con alarma solo en la consola. Revisá:
   - que la instalación haya terminado bien (`gpiozero` y `lgpio`);
