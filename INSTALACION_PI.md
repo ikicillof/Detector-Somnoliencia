@@ -101,7 +101,8 @@ python detector_somnoliencia.py --sin-ventana
   **cada vez** que abrís una terminal nueva. Te das cuenta de que está
   activo porque el renglón empieza con `(venv)`.
 - Al arrancar se **calibra solo**: mirá al frente y quedate quieto unos
-  segundos. Si te movés, reintenta solo hasta que salga bien.
+  segundos. Si te movés, reintenta solo hasta que salga bien. Cuando
+  termina, el buzzer hace un pitido muy cortito.
 - En la consola van apareciendo los eventos con la hora: calibración,
   rostro detectado/perdido y las alertas (`ALERTA: OJOS CERRADOS`,
   `ALERTA: CABEZA CAIDA`, `ALERTA: cabeceo brusco detectado`).
@@ -167,6 +168,8 @@ Patrones de la alarma:
 - **Peligro** (ojos cerrados o cabeza caída): pitido largo que se repite
   mientras dure.
 - **Aviso** (cabeceo brusco): dos pitidos cortos.
+- **Calibración lista:** un pitido muy cortito cuando termina de calibrar
+  (ya podés dejar de mirar fijo al frente). No es una alerta.
 
 ---
 

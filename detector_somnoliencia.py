@@ -26,8 +26,9 @@
 # Cualquiera de las tres condiciones (ojos cerrados, cabeza caída, cabeceo
 # brusco) dispara la alarma: pitidos y un cartel rojo en pantalla. En la PC
 # suena por los parlantes; en la Raspberry Pi, por un buzzer en un pin GPIO.
-# Hay dos niveles con patrones de pitidos distintos (ver PATRONES_ALARMA):
-# ojos cerrados / cabeza caída = peligro; cabeceo brusco = aviso.
+# Hay dos niveles de alerta con patrones de pitidos distintos (ver
+# PATRONES_ALARMA): ojos cerrados / cabeza caída = peligro; cabeceo brusco =
+# aviso. Además suena un pitido muy corto cuando termina la calibración.
 #
 # ¿QUÉ ES "MEDIAPIPE FACE LANDMARKER"?
 # -------------------------------------
@@ -328,12 +329,18 @@ BUZZER_GPIO = 21
 # Patrones de pitidos de cada nivel de alerta, como lista de
 # (segundos_sonando, segundos_en_silencio). Así se distinguen de oído sin
 # mirar la pantalla:
-#   NIVEL_AVISO   -> cabeceo brusco (evento instantáneo): dos pitidos cortos.
-#   NIVEL_PELIGRO -> ojos cerrados o cabeza caída sostenida: un pitido largo
-#                    que se repite mientras dure la condición.
-NIVEL_AVISO = 1
-NIVEL_PELIGRO = 2
+#   NIVEL_CALIBRADO -> la calibración terminó bien: un pitido muy corto, solo
+#                      para avisar que ya se puede dejar de mirar al frente.
+#                      No es una alerta.
+#   NIVEL_AVISO     -> cabeceo brusco (evento instantáneo): dos pitidos cortos.
+#   NIVEL_PELIGRO   -> ojos cerrados o cabeza caída sostenida: un pitido largo
+#                      que se repite mientras dure la condición.
+# El número indica la prioridad: si se piden dos a la vez, suena el mayor.
+NIVEL_CALIBRADO = 1
+NIVEL_AVISO = 2
+NIVEL_PELIGRO = 3
 PATRONES_ALARMA = {
+    NIVEL_CALIBRADO: [(0.08, 0.0)],
     NIVEL_AVISO: [(0.12, 0.08), (0.12, 0.30)],
     NIVEL_PELIGRO: [(ALARM_DURATION_MS / 1000.0, 0.10)],
 }
@@ -1138,12 +1145,15 @@ class Alarma:
         return salida
 
     def disparar(self, nivel):
-        """Pide que suene el patrón de 'nivel' (NIVEL_AVISO o NIVEL_PELIGRO).
+        """Pide que suene el patrón de 'nivel' (NIVEL_CALIBRADO, NIVEL_AVISO
+        o NIVEL_PELIGRO).
         Vuelve al instante. Si ya está sonando un patrón, el pedido queda
         anotado y se reproduce cuando ese termina; varios pedidos seguidos se
         juntan en uno solo (gana el nivel más alto). Así, mientras una
         condición se mantiene, el patrón se repite sin superponerse."""
         if self.solo_visual:
+            if nivel == NIVEL_CALIBRADO:
+                return  # no es una alerta; la consola ya avisa la calibración
             # Sin sonido: avisamos por consola, como mucho una vez por segundo
             # para no inundarla (el bucle llama a esto en cada frame).
             ahora = time.time()
@@ -1782,6 +1792,7 @@ def main():
             # cuándo se termina, con hora, para seguirlo en la consola.
             if calibrando_antes and not detector_cabeceos.calibrando:
                 log("Calibración terminada: detección de cabeceos activa.")
+                alarma.disparar(NIVEL_CALIBRADO)  # pitido corto de "listo"
             calibrando_antes = detector_cabeceos.calibrando
 
             # Mantenemos el cartel de cabeceo unos segundos después del evento.
