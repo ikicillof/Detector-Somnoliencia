@@ -24,7 +24,10 @@
 #        posición final.
 #
 # Cualquiera de las tres condiciones (ojos cerrados, cabeza caída, cabeceo
-# brusco) dispara la misma alarma: un pitido y un cartel rojo en pantalla.
+# brusco) dispara la alarma: pitidos y un cartel rojo en pantalla. En la PC
+# suena por los parlantes; en la Raspberry Pi, por un buzzer en un pin GPIO.
+# Hay dos niveles con patrones de pitidos distintos (ver PATRONES_ALARMA):
+# ojos cerrados / cabeza caída = peligro; cabeceo brusco = aviso.
 #
 # ¿QUÉ ES "MEDIAPIPE FACE LANDMARKER"?
 # -------------------------------------
@@ -98,8 +101,8 @@
 # pitch mientras el conductor mira al frente y guarda eso como "posición
 # neutra". De ahí en más todo se mide como DESVIACIÓN respecto de ese neutro.
 # La calibración se valida (si el conductor se movió o no miraba al frente,
-# se reintenta sola), y se puede rehacer en cualquier momento con la tecla
-# 'c'.
+# se reintenta sola, sin tocar ninguna tecla). En el modo sin ventana además
+# se puede rehacer a mano escribiendo 'c' + Enter en la consola.
 #
 # ¿POR QUÉ TODO SE MIDE EN SEGUNDOS Y NO EN "CUADROS"?
 # -----------------------------------------------------
@@ -121,12 +124,14 @@
 import os
 import sys
 import time
+import argparse   # Para leer opciones de la línea de comandos (--sin-ventana).
+import queue      # Cola segura entre hilos (comandos escritos en la consola).
+import signal     # Para cerrar ordenadamente si el sistema pide terminar.
+import subprocess # Para consultar 'vcgencmd' en la Raspberry Pi.
+import platform   # Para saber en qué sistema operativo estamos (Windows,
+                  # Linux...) y elegir cómo hacer sonar la alarma.
 import threading
 import urllib.request  # Para descargar el modelo de MediaPipe la primera vez.
-import winsound  # Módulo de Windows para reproducir sonidos simples (pitidos).
-                 # NOTA: el reemplazo multiplataforma (numpy + sounddevice) es
-                 # parte de la fase de "sonido multiplataforma", todavía
-                 # pendiente. Por ahora sigue acá como en la versión anterior.
 from collections import deque, namedtuple  # 'deque': cola doble para guardar
                                # los últimos valores de pitch (suavizado y
                                # velocidad). 'namedtuple': para devolver la
@@ -272,9 +277,12 @@ CALIBRACION_ESTABILIDAD_MAX_GRADOS = 8.0
 # descarta y se reintenta. Rango razonable: 12 a 25 grados.
 CALIBRACION_YAW_MAX_GRADOS = 18.0
 
-# Cuántas veces se reintenta la calibración antes de aceptarla igual (con un
-# aviso de "calibración dudosa" en pantalla). Rango razonable: 2 a 5.
-CALIBRACION_MAX_INTENTOS = 3
+# Si la calibración falla, se REINTENTA SOLA, sin límite y sin tocar ninguna
+# tecla, hasta que salga bien: nunca se acepta una calibración mala. Mientras
+# tanto la detección de ojos cerrados funciona igual; solo la de cabeceos
+# queda en pausa. Cada esta cantidad de intentos fallidos seguidos se imprime
+# un recordatorio de que los cabeceos todavía no se están vigilando.
+CALIBRACION_AVISO_CADA_INTENTOS = 3
 
 # --- Autoverificación del signo del pitch ---
 # El signo del pitch de solvePnP no es 100% predecible de antemano. El
@@ -303,9 +311,32 @@ SIGNO_PITCH = 1.0
 
 # --- Alarma sonora ---
 # Frecuencia del pitido (en Hz, más alto = más agudo) y duración de cada
-# pitido (en milisegundos).
+# pitido (en milisegundos). La frecuencia solo se usa en la PC (por los
+# parlantes); el buzzer activo de la Raspberry Pi tiene un tono fijo.
 ALARM_FREQ_HZ = 2500
 ALARM_DURATION_MS = 700
+
+# Pin GPIO (numeración BCM, NO el número de pin físico) donde está conectada
+# la base del transistor que maneja el buzzer activo en la Raspberry Pi.
+# Conexión actual:
+#   pin físico 12 (GPIO18) -> resistencia de 1 kΩ -> base del transistor NPN
+#   pin físico 2 (5 V)     -> + del buzzer;  - del buzzer -> colector
+#   pin físico 14 (GND)    -> emisor
+# El GPIO en alto satura el transistor y el buzzer suena.
+BUZZER_GPIO = 18
+
+# Patrones de pitidos de cada nivel de alerta, como lista de
+# (segundos_sonando, segundos_en_silencio). Así se distinguen de oído sin
+# mirar la pantalla:
+#   NIVEL_AVISO   -> cabeceo brusco (evento instantáneo): dos pitidos cortos.
+#   NIVEL_PELIGRO -> ojos cerrados o cabeza caída sostenida: un pitido largo
+#                    que se repite mientras dure la condición.
+NIVEL_AVISO = 1
+NIVEL_PELIGRO = 2
+PATRONES_ALARMA = {
+    NIVEL_AVISO: [(0.12, 0.08), (0.12, 0.30)],
+    NIVEL_PELIGRO: [(ALARM_DURATION_MS / 1000.0, 0.10)],
+}
 
 # --- Modelo de MediaPipe ---
 # Dirección de internet de donde se descarga el modelo de detección facial, y
@@ -506,7 +537,7 @@ class DetectorCabeceos:
     Antes de detectar nada se toma CALIBRACION_SEGUNDOS para promediar el
     pitch neutro (conductor mirando al frente). Esa calibración se valida (si
     el conductor se movió mucho o no miraba al frente, se descarta y se
-    reintenta hasta CALIBRACION_MAX_INTENTOS veces). Mientras calibra,
+    reintenta sola, todas las veces que haga falta). Mientras calibra,
     'calibrando' vale True y siempre devuelve (False, False). Se puede rehacer
     en cualquier momento con recalibrar().
 
@@ -530,7 +561,6 @@ class DetectorCabeceos:
         self.calibrando = True
         self._intentos_calibracion = 0
         self.aviso_calibracion = ""       # motivo del reintento, para el HUD
-        self.calibracion_dudosa = False   # se aceptó tras agotar los intentos
 
         # --- Signo del pitch ---
         # Signo autodetectado (se usa solo si SIGNO_PITCH es None). Arranca en
@@ -586,7 +616,6 @@ class DetectorCabeceos:
         self.calibrando = True
         self._intentos_calibracion = 0
         self.aviso_calibracion = ""
-        self.calibracion_dudosa = False
         self._historial_signo.clear()
         self._historial.clear()
         self._historial_suave.clear()
@@ -676,18 +705,17 @@ class DetectorCabeceos:
             print(f"Calibracion OK. Pitch neutro = {self.pitch_neutro:+.1f} grados.")
             return
 
+        # Falló: se reintenta sola. Vaciamos las muestras y volvemos a
+        # arrancar el reloj; no hace falta tocar ninguna tecla.
         self._intentos_calibracion += 1
-        if self._intentos_calibracion >= CALIBRACION_MAX_INTENTOS:
-            fijar_neutro()
-            self.calibracion_dudosa = True
-            self.aviso_calibracion = ""
-            print(f"AVISO: calibracion dudosa ({motivo}). Se usa igual; apreta "
-                  f"'c' para rehacerla mirando al frente y quieto.")
-            return
-
-        # Reintento: vaciamos las muestras y volvemos a arrancar el reloj.
-        self.aviso_calibracion = f"Calibracion: {motivo}. Reintentando..."
-        print(f"Calibracion: {motivo}. Reintentando...")
+        self.aviso_calibracion = (f"Calibracion: {motivo}. Reintentando "
+                                  f"(intento {self._intentos_calibracion + 1})...")
+        print(f"Calibracion fallida ({motivo}). Reintentando automaticamente "
+              f"(intento {self._intentos_calibracion + 1}): mira al frente y "
+              f"quedate quieto.")
+        if self._intentos_calibracion % CALIBRACION_AVISO_CADA_INTENTOS == 0:
+            print("AVISO: la deteccion de cabeceos sigue en pausa hasta que la "
+                  "calibracion salga bien (la de ojos cerrados funciona igual).")
         self._muestras_calibracion = []
         self._yaws_calibracion = []
         self._proxys_calibracion = []
@@ -883,6 +911,11 @@ def crear_detector_facial():
         running_mode=mp_vision.RunningMode.VIDEO,
         min_face_detection_confidence=0.5,
         min_tracking_confidence=0.5,
+        # Salidas extra que NO usamos: apagarlas ahorra trabajo en cada
+        # cuadro (sobre todo los "blendshapes", que corren otra red
+        # neuronal más). Solo necesitamos los puntos de la cara.
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=False,
     )
     return mp_vision.FaceLandmarker.create_from_options(opciones)
 
@@ -947,40 +980,244 @@ def procesar_frame(frame, detector_facial, timestamp_ms):
 
 
 # ==============================================================================
-# ALARMA SONORA
+# ALARMA (MULTIPLATAFORMA)
 # ==============================================================================
+#
+# El resto del programa solo conoce la clase 'Alarma' y sus tres métodos:
+#
+#   alarma.disparar(nivel)  -> pide que suene el patrón de ese nivel.
+#   alarma.callar()         -> corta lo que esté sonando.
+#   alarma.cerrar()         -> apaga todo al salir del programa.
+#
+# Por dentro, al arrancar, elige el "backend" (la forma concreta de hacer
+# ruido) según la máquina:
+#
+#   - Raspberry Pi -> buzzer activo por GPIO, a través de un transistor, con
+#                     la librería gpiozero (backend lgpio).
+#   - Windows / PC -> tono por los parlantes, generado con numpy y reproducido
+#                     con sounddevice.
+#   - Si la librería que hace falta no carga (no está instalada, no hay
+#     permisos sobre el GPIO, no hay placa de sonido...) se muestra una
+#     advertencia y la alarma queda solo en pantalla/consola. El programa
+#     NUNCA se corta por culpa de la alarma: detectar somnolencia es más
+#     importante que el sonido.
+#
+# Los pitidos se reproducen en un HILO aparte (un "trabajador" que espera
+# pedidos). Así 'disparar()' vuelve al instante y el bucle de video nunca se
+# congela mientras suena la alarma.
 
-def reproducir_alarma():
-    """Reproduce un pitido de alarma usando el altavoz de la computadora.
+def es_raspberry_pi():
+    """True si el programa está corriendo en una Raspberry Pi.
 
-    Esta función se ejecuta DENTRO DE UN HILO SEPARADO (ver 'threading' más
-    abajo), nunca directamente en el bucle principal de video. La razón es
-    que winsound.Beep() es una función "bloqueante": mientras el pitido está
-    sonando, el programa no puede hacer nada más. Si la llamáramos
-    directamente en el bucle principal, la ventana de video se congelaría
-    (dejaría de actualizarse) durante toda la duración del pitido. Al
-    correrla en un hilo aparte, la cámara y el video pueden seguir
-    funcionando normalmente mientras el sonido se reproduce de fondo."""
-    winsound.Beep(ALARM_FREQ_HZ, ALARM_DURATION_MS)
+    Linux expone el modelo de la placa en /proc/device-tree/model (por
+    ejemplo "Raspberry Pi 4 Model B Rev 1.4"). En Windows o en una PC común
+    ese archivo no existe, y devolvemos False."""
+    if platform.system() != "Linux":
+        return False
+    try:
+        with open("/proc/device-tree/model", "r", errors="ignore") as archivo:
+            return "raspberry pi" in archivo.read().lower()
+    except OSError:
+        return False
 
 
-def disparar_alarma_si_corresponde(hilo_alarma):
-    """Lanza el pitido de alarma en un hilo nuevo, si no hay uno sonando ya.
+class _SalidaBuzzer:
+    """Buzzer activo conectado a un pin GPIO de la Raspberry Pi (vía
+    transistor). Un buzzer ACTIVO suena solo con recibir tensión, así que
+    alcanza con prenderlo y apagarlo."""
 
-    Devuelve el hilo (nuevo o el que ya estaba) para que quien la llama lo
-    siga teniendo a mano. Esta función la comparten las TRES condiciones de
-    alerta (ojos cerrados, cabeza caída y cabeceo brusco): el guard
-    'is_alive()' evita que, si varias se activan casi juntas o una se
-    mantiene varios segundos, se disparen decenas de pitidos superpuestos.
-    Se reproduce un pitido y, apenas termina, si la condición sigue, arranca
-    el siguiente."""
-    if hilo_alarma is None or not hilo_alarma.is_alive():
-        hilo_alarma = threading.Thread(target=reproducir_alarma, daemon=True)
-        # 'daemon=True' significa que este hilo no va a impedir que el
-        # programa se cierre si vos apretás 'q': Python lo corta junto con
-        # todo lo demás al salir.
-        hilo_alarma.start()
-    return hilo_alarma
+    nombre = "buzzer GPIO"
+
+    def __init__(self, pin):
+        # gpiozero puede usar varias librerías de bajo nivel para manejar los
+        # pines; en Raspberry Pi OS actual la que funciona es lgpio. La
+        # elegimos explícitamente, salvo que el usuario haya fijado otra.
+        os.environ.setdefault("GPIOZERO_PIN_FACTORY", "lgpio")
+        from gpiozero import Buzzer  # import acá: solo existe en la Pi
+        self._buzzer = Buzzer(pin)
+        self.nombre = f"buzzer GPIO{pin}"
+
+    def encender(self):
+        self._buzzer.on()
+
+    def apagar(self):
+        self._buzzer.off()
+
+    def cerrar(self):
+        self._buzzer.off()
+        self._buzzer.close()
+
+
+class _SalidaParlante:
+    """Tono senoidal por los parlantes de la computadora, con sounddevice."""
+
+    nombre = "parlantes (sounddevice)"
+    _MUESTRAS_POR_SEG = 44100
+
+    def __init__(self):
+        import sounddevice  # import acá: si falta, se usa el modo sin sonido
+        self._sd = sounddevice
+        # Verificamos que exista un dispositivo de salida; si no, esto lanza
+        # una excepción y caemos al modo sin sonido.
+        self._sd.query_devices(kind="output")
+        self._tonos = {}  # duración -> arreglo con el tono ya generado
+
+    def _tono(self, segundos):
+        """Genera (una sola vez por duración) la onda del pitido."""
+        if segundos not in self._tonos:
+            t = np.arange(int(self._MUESTRAS_POR_SEG * segundos)) / self._MUESTRAS_POR_SEG
+            onda = 0.5 * np.sin(2 * np.pi * ALARM_FREQ_HZ * t)
+            # Rampa de 5 ms al principio y al final para que no haga "clic".
+            rampa = min(len(onda) // 2, int(0.005 * self._MUESTRAS_POR_SEG))
+            if rampa > 0:
+                envolvente = np.linspace(0.0, 1.0, rampa)
+                onda[:rampa] *= envolvente
+                onda[-rampa:] *= envolvente[::-1]
+            self._tonos[segundos] = onda.astype(np.float32)
+        return self._tonos[segundos]
+
+    def encender(self, segundos):
+        # sd.play() NO bloquea: arranca el sonido y vuelve enseguida.
+        self._sd.play(self._tono(segundos), self._MUESTRAS_POR_SEG)
+
+    def apagar(self):
+        self._sd.stop()
+
+    def cerrar(self):
+        self._sd.stop()
+
+
+class Alarma:
+    """Alarma con la misma interfaz en la Raspberry Pi y en la PC. Ver la
+    explicación al principio de esta sección."""
+
+    def __init__(self):
+        self._salida = self._elegir_salida()
+        self.solo_visual = self._salida is None
+
+        # Comunicación con el hilo trabajador: el nivel pedido (0 = nada) y
+        # un "Condition" para despertarlo cuando llega un pedido.
+        self._condicion = threading.Condition()
+        self._nivel_pedido = 0
+        self._cerrando = False
+        # Se activa para interrumpir un patrón a mitad de camino.
+        self._cortar = threading.Event()
+        self._ultimo_aviso_consola = 0.0
+
+        self._hilo = None
+        if not self.solo_visual:
+            self._hilo = threading.Thread(target=self._trabajador, daemon=True)
+            self._hilo.start()
+
+    def _elegir_salida(self):
+        """Prueba la salida que corresponde a esta máquina. Si falla, avisa y
+        devuelve None (alarma solo visual/consola)."""
+        if es_raspberry_pi():
+            try:
+                salida = _SalidaBuzzer(BUZZER_GPIO)
+            except Exception as error:
+                print("ADVERTENCIA: no se pudo usar el buzzer por GPIO "
+                      f"({type(error).__name__}: {error}).")
+                print("  Revisá que estén instalados gpiozero y lgpio, y que "
+                      "tu usuario esté en el grupo 'gpio'.")
+                print("  El programa sigue, pero la alarma va a ser SOLO "
+                      "VISUAL/CONSOLA.")
+                return None
+        else:
+            try:
+                salida = _SalidaParlante()
+            except Exception as error:
+                print("ADVERTENCIA: no se pudo usar el sonido "
+                      f"({type(error).__name__}: {error}).")
+                print("  Revisá que esté instalado sounddevice "
+                      "(pip install sounddevice) y que haya parlantes.")
+                print("  El programa sigue, pero la alarma va a ser SOLO "
+                      "VISUAL/CONSOLA.")
+                return None
+        print(f"Alarma: usando {salida.nombre}.")
+        return salida
+
+    def disparar(self, nivel):
+        """Pide que suene el patrón de 'nivel' (NIVEL_AVISO o NIVEL_PELIGRO).
+        Vuelve al instante. Si ya está sonando un patrón, el pedido queda
+        anotado y se reproduce cuando ese termina; varios pedidos seguidos se
+        juntan en uno solo (gana el nivel más alto). Así, mientras una
+        condición se mantiene, el patrón se repite sin superponerse."""
+        if self.solo_visual:
+            # Sin sonido: avisamos por consola, como mucho una vez por segundo
+            # para no inundarla (el bucle llama a esto en cada frame).
+            ahora = time.time()
+            if ahora - self._ultimo_aviso_consola >= 1.0:
+                self._ultimo_aviso_consola = ahora
+                print("\a*** ALARMA ***", flush=True)  # '\a' = campana de la terminal
+            return
+        with self._condicion:
+            self._nivel_pedido = max(self._nivel_pedido, nivel)
+            self._condicion.notify()
+
+    def callar(self):
+        """Corta el patrón que esté sonando y descarta pedidos pendientes."""
+        if self.solo_visual:
+            return
+        with self._condicion:
+            self._nivel_pedido = 0
+        self._cortar.set()
+
+    def cerrar(self):
+        """Apaga la alarma y termina el hilo. Llamar siempre al salir: en la
+        Pi, si el programa se corta con el buzzer prendido, puede quedar
+        sonando."""
+        if self.solo_visual:
+            return
+        with self._condicion:
+            self._cerrando = True
+            self._nivel_pedido = 0
+            self._condicion.notify()
+        self._cortar.set()
+        if self._hilo is not None:
+            self._hilo.join(timeout=2.0)
+        try:
+            self._salida.cerrar()
+        except Exception:
+            pass
+
+    def _trabajador(self):
+        """Corre en su propio hilo: espera pedidos y reproduce los patrones."""
+        while True:
+            with self._condicion:
+                while self._nivel_pedido == 0 and not self._cerrando:
+                    self._condicion.wait()
+                if self._cerrando:
+                    return
+                nivel = self._nivel_pedido
+                self._nivel_pedido = 0
+                self._cortar.clear()
+            try:
+                self._reproducir(PATRONES_ALARMA[nivel])
+            except Exception as error:
+                # Un error de audio/GPIO a mitad de camino no debe matar el
+                # hilo ni el programa: avisamos y seguimos.
+                print(f"ADVERTENCIA: fallo al hacer sonar la alarma: {error}")
+            finally:
+                try:
+                    self._salida.apagar()
+                except Exception:
+                    pass
+
+    def _reproducir(self, patron):
+        """Reproduce un patrón (lista de (sonando, silencio) en segundos).
+        Usa Event.wait() en lugar de time.sleep() para poder cortarlo al
+        instante con callar() o cerrar()."""
+        for sonando, silencio in patron:
+            if isinstance(self._salida, _SalidaParlante):
+                self._salida.encender(sonando)
+            else:
+                self._salida.encender()
+            if self._cortar.wait(sonando):
+                return
+            self._salida.apagar()
+            if self._cortar.wait(silencio):
+                return
 
 
 # ==============================================================================
@@ -1048,24 +1285,292 @@ def dibujar_hud(frame, ear_promedio, segundos_ojos_cerrados, detector_cabeceos):
                       f"desv: {detector_cabeceos.desviacion:+.1f}")
         cv2.putText(frame, texto_pose, (10, alto_frame - 40),
                     fuente, 0.6, verde, 2, cv2.LINE_AA)
-        marca_dudosa = "  [CALIB. DUDOSA - apreta 'c']" if detector_cabeceos.calibracion_dudosa else ""
         texto_pose2 = (f"vel: {detector_cabeceos.ultima_velocidad:+.0f}/s   "
                        f"caida: {detector_cabeceos.segundos_caida:.1f}s"
-                       f" / {CABEZA_CAIDA_SEGUNDOS:.1f}s{marca_dudosa}")
-        color2 = amarillo if detector_cabeceos.calibracion_dudosa else verde
+                       f" / {CABEZA_CAIDA_SEGUNDOS:.1f}s")
         cv2.putText(frame, texto_pose2, (10, alto_frame - 16),
-                    fuente, 0.6, color2, 2, cv2.LINE_AA)
+                    fuente, 0.6, verde, 2, cv2.LINE_AA)
     else:
         cv2.putText(frame, "pitch: -- (sin pose)", (10, alto_frame - 40),
                     fuente, 0.6, amarillo, 2, cv2.LINE_AA)
 
 
 # ==============================================================================
+# CAPTURA DE LA CÁMARA EN UN HILO APARTE
+# ==============================================================================
+#
+# ¿POR QUÉ UN HILO APARTE?
+# La cámara entrega cuadros a un ritmo fijo (por ejemplo 30 por segundo). Si
+# el programa procesa más lento que eso (le pasa a la Raspberry Pi, donde
+# MediaPipe tarda bastante por cuadro), los cuadros que no llegó a leer se
+# van acumulando en una cola dentro del driver de la cámara. Cada vez que el
+# programa pide "el próximo cuadro" recibe uno VIEJO, de hace varios
+# segundos: eso es el "delay" que se veía en la Pi. Para un detector de
+# somnolencia eso es grave: la alarma sonaría tarde.
+#
+# La solución: un hilo dedicado que lee la cámara sin parar, lo más rápido
+# que ella entregue, y guarda SOLO el último cuadro (los anteriores se
+# descartan). El bucle de procesamiento, cuando termina con un cuadro, toma
+# siempre el más reciente. Así nunca se procesa una imagen vieja.
+
+def abrir_camara(indice, ancho, alto):
+    """Abre la cámara con la configuración que menos delay genera.
+
+    - Backend según la plataforma: V4L2 en Linux (el nativo; es el que
+      respeta bien formato y tamaño de buffer) y DirectShow en Windows (que
+      acepta pedir MJPG). Si con ese backend no abre, se prueba el automático.
+    - Formato MJPG: la cámara manda cada cuadro ya comprimido en JPEG. Por
+      USB pasan muchos menos datos que en crudo (YUYV), así que la cámara
+      puede dar más cuadros por segundo a la misma resolución.
+    - Buffer de 1 cuadro: que el driver no guarde cuadros viejos.
+    - Resolución: si 'ancho'/'alto' son None se deja la que trae la cámara.
+
+    Devuelve el cv2.VideoCapture abierto, o None si no se pudo abrir."""
+    sistema = platform.system()
+    if sistema == "Linux":
+        backend = cv2.CAP_V4L2
+    elif sistema == "Windows":
+        backend = cv2.CAP_DSHOW
+    else:
+        backend = cv2.CAP_ANY
+
+    captura = cv2.VideoCapture(indice, backend)
+    if not captura.isOpened() and backend != cv2.CAP_ANY:
+        captura.release()
+        captura = cv2.VideoCapture(indice)
+    if not captura.isOpened():
+        captura.release()
+        return None
+
+    # Orden importante: primero el formato, después la resolución (algunos
+    # drivers solo ofrecen ciertas resoluciones en MJPG).
+    captura.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    if ancho and alto:
+        captura.set(cv2.CAP_PROP_FRAME_WIDTH, ancho)
+        captura.set(cv2.CAP_PROP_FRAME_HEIGHT, alto)
+    captura.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # no todos los backends lo aceptan
+
+    # Mostramos lo que la cámara REALMENTE aceptó (puede ignorar el pedido).
+    fourcc = int(captura.get(cv2.CAP_PROP_FOURCC))
+    formato = "".join(chr((fourcc >> (8 * i)) & 0xFF) for i in range(4))
+    log(f"Cámara {indice}: {int(captura.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
+        f"{int(captura.get(cv2.CAP_PROP_FRAME_HEIGHT))}, formato "
+        f"{formato.strip() or '?'}, {captura.get(cv2.CAP_PROP_FPS):.0f} FPS "
+        f"nominales, backend {captura.getBackendName()}.")
+    return captura
+
+
+class CapturaEnHilo:
+    """Lee la cámara en un hilo propio y se queda solo con el último cuadro.
+
+    Uso:
+        camara = CapturaEnHilo(captura)
+        numero, frame, momento = camara.esperar_cuadro_nuevo(numero_anterior)
+        ...
+        camara.detener()
+
+    Cada cuadro tiene un 'numero' que va en aumento, para saber si es nuevo,
+    y el 'momento' (time.time()) en que se capturó."""
+
+    # Si la cámara no entrega ningún cuadro durante este tiempo, se considera
+    # perdida (desconectada).
+    SEGUNDOS_SIN_CUADROS_PERDIDA = 5.0
+
+    def __init__(self, captura):
+        self._captura = captura
+        self._condicion = threading.Condition()
+        self._frame = None
+        self._numero = 0
+        self._momento = 0.0
+        self._activa = True
+        self.perdida = False
+        self.cuadros_leidos = 0   # contador total, para calcular FPS de captura
+        self._hilo = threading.Thread(target=self._leer_sin_parar, daemon=True)
+        self._hilo.start()
+
+    def _leer_sin_parar(self):
+        ultimo_ok = time.time()
+        while self._activa:
+            ok, frame = self._captura.read()
+            ahora = time.time()
+            if not ok:
+                if ahora - ultimo_ok > self.SEGUNDOS_SIN_CUADROS_PERDIDA:
+                    with self._condicion:
+                        self.perdida = True
+                        self._condicion.notify_all()
+                    return
+                time.sleep(0.01)
+                continue
+            ultimo_ok = ahora
+            with self._condicion:
+                # Pisamos el cuadro anterior: si nadie lo procesó, se pierde.
+                # Es justamente lo que queremos.
+                self._frame = frame
+                self._numero += 1
+                self._momento = ahora
+                self.cuadros_leidos += 1
+                self._condicion.notify_all()
+
+    def esperar_cuadro_nuevo(self, numero_anterior, numero_minimo=None,
+                             timeout=1.0):
+        """Espera hasta que haya un cuadro con número > 'numero_anterior'
+        (o >= 'numero_minimo', si se indica) y devuelve (numero, frame,
+        momento). Devuelve (None, None, None) si pasó 'timeout' sin cuadros
+        nuevos o si la cámara se perdió (mirar el atributo 'perdida')."""
+        if numero_minimo is None:
+            numero_minimo = numero_anterior + 1
+        with self._condicion:
+            hay_nuevo = self._condicion.wait_for(
+                lambda: self._numero >= numero_minimo or self.perdida
+                or not self._activa,
+                timeout=timeout)
+            if not hay_nuevo or self.perdida or not self._activa:
+                return None, None, None
+            return self._numero, self._frame, self._momento
+
+    def detener(self):
+        """Frena el hilo y libera la cámara."""
+        self._activa = False
+        with self._condicion:
+            self._condicion.notify_all()
+        self._hilo.join(timeout=2.0)
+        self._captura.release()
+
+
+def revisar_alimentacion_pi():
+    """En la Raspberry Pi, pregunta al firmware (vcgencmd get_throttled) si
+    hubo bajo voltaje o exceso de temperatura. Las dos cosas hacen que la Pi
+    baje su velocidad a propósito ("throttling") y el detector vaya lento.
+    Si el comando no existe, no hace nada."""
+    if not es_raspberry_pi():
+        return
+    try:
+        salida = subprocess.run(["vcgencmd", "get_throttled"],
+                                capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return
+    texto = salida.stdout.strip()          # por ejemplo "throttled=0x50005"
+    if "=" not in texto:
+        return
+    valor_texto = texto.split("=", 1)[1]
+    try:
+        valor = int(valor_texto, 16)
+    except ValueError:
+        return
+    if valor == 0:
+        log("Alimentación y temperatura de la Pi: OK (throttled=0x0).")
+        return
+
+    # Significado de cada bit (documentación oficial de Raspberry Pi):
+    # los bits 0-3 son lo que pasa AHORA; los 16-19, lo que pasó desde que
+    # se prendió la Pi.
+    problemas = {
+        0: "bajo voltaje AHORA (fuente insuficiente o cable malo)",
+        1: "frecuencia de la CPU limitada AHORA",
+        2: "la Pi está frenada (throttled) AHORA",
+        3: "límite de temperatura AHORA",
+        16: "hubo bajo voltaje desde que se prendió",
+        17: "hubo frecuencia limitada desde que se prendió",
+        18: "estuvo frenada desde que se prendió",
+        19: "llegó al límite de temperatura desde que se prendió",
+    }
+    log(f"ADVERTENCIA: vcgencmd get_throttled = {valor_texto} (debería ser 0x0).")
+    for bit, descripcion in problemas.items():
+        if valor & (1 << bit):
+            print(f"  - {descripcion}")
+    print("  Usá la fuente oficial (5 V / 3 A en la Pi 4, 2,5 A en la Pi 3) y "
+          "un disipador o ventilador: si no, el detector va a ir más lento.")
+
+
+# ==============================================================================
 # BUCLE PRINCIPAL
 # ==============================================================================
 
+def log(mensaje):
+    """Imprime un evento en la consola con la hora adelante. En modo sin
+    ventana la consola es la única forma de ver qué está pasando."""
+    print(f"[{time.strftime('%H:%M:%S')}] {mensaje}", flush=True)
+
+
+def leer_argumentos():
+    """Lee las opciones de la línea de comandos. Ejemplo:
+        python detector_somnoliencia.py --sin-ventana"""
+    parser = argparse.ArgumentParser(
+        description="Detector de somnolencia por cámara (ojos y cabeceos).")
+    parser.add_argument(
+        "--sin-ventana", action="store_true",
+        help="no abre la ventana de video (para usar por SSH o sin monitor). "
+             "Salís con Ctrl+C.")
+    parser.add_argument(
+        "--ancho", type=int, default=None,
+        help="ancho de la imagen pedida a la cámara, en píxeles "
+             "(por defecto 640 en la Raspberry Pi; en la PC, el de la cámara).")
+    parser.add_argument(
+        "--alto", type=int, default=None,
+        help="alto de la imagen pedida a la cámara, en píxeles "
+             "(por defecto 480 en la Raspberry Pi; en la PC, el de la cámara).")
+    parser.add_argument(
+        "--saltar", type=int, default=1, metavar="N",
+        help="procesar 1 de cada N cuadros de la cámara (por defecto 1 = "
+             "todos). Sirve si la máquina no da abasto. Los tiempos de "
+             "detección siguen medidos en segundos, no en cuadros.")
+    argumentos = parser.parse_args()
+    if argumentos.saltar < 1:
+        parser.error("--saltar tiene que ser 1 o más.")
+    if (argumentos.ancho is None) != (argumentos.alto is None):
+        parser.error("--ancho y --alto se usan juntos.")
+    if argumentos.ancho is None and es_raspberry_pi():
+        argumentos.ancho, argumentos.alto = 640, 480
+    return argumentos
+
+
+def hay_pantalla():
+    """False si estamos en Linux sin entorno gráfico (por ejemplo, conectados
+    por SSH a la Raspberry Pi). Ahí cv2.imshow aborta el programa con
+    'qt.qpa.xcb: could not connect to display', así que hay que evitarlo.
+    En Windows y macOS siempre hay pantalla."""
+    if platform.system() != "Linux":
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def escuchar_teclado(comandos):
+    """Corre en un hilo aparte en modo sin ventana: lee líneas de la consola
+    y las deja en la cola 'comandos'. Así se puede recalibrar escribiendo 'c'
+    + Enter (y salir con 'q' + Enter, además de Ctrl+C), aunque no haya
+    ventana donde apretar teclas."""
+    while True:
+        try:
+            linea = sys.stdin.readline()
+        except (OSError, ValueError):
+            return
+        if not linea:  # se cerró la entrada (por ejemplo, corre como servicio)
+            return
+        comandos.put(linea.strip().lower())
+
+
 def main():
     """Función principal: abre la cámara y corre el bucle de detección."""
+    argumentos = leer_argumentos()
+
+    # --- ¿Con o sin ventana? ---
+    mostrar_ventana = not argumentos.sin_ventana
+    if mostrar_ventana and not hay_pantalla():
+        mostrar_ventana = False
+        log("No hay pantalla (no existe DISPLAY ni WAYLAND_DISPLAY): se activa "
+            "automáticamente el modo --sin-ventana.")
+
+    # En Linux, si alguien manda la señal de terminar (por ejemplo, 'kill' o
+    # al detener un servicio), la tratamos igual que Ctrl+C para cerrar
+    # ordenadamente y no dejar el buzzer sonando.
+    if platform.system() == "Linux":
+        def _al_terminar(_senal, _marco):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, _al_terminar)
+
+    # En la Pi, avisar de entrada si la fuente o la temperatura la frenan.
+    revisar_alimentacion_pi()
+
     # --- Preparamos el detector facial de MediaPipe ---
     detector_facial = crear_detector_facial()
 
@@ -1073,9 +1578,9 @@ def main():
     detector_cabeceos = DetectorCabeceos()
 
     # --- Abrimos la webcam ---
-    captura = cv2.VideoCapture(CAMARA_INDICE)
+    captura = abrir_camara(CAMARA_INDICE, argumentos.ancho, argumentos.alto)
 
-    if not captura.isOpened():
+    if captura is None:
         # Si no se pudo abrir la cámara (no hay cámara, está siendo usada
         # por otro programa, permisos de Windows bloqueados, etc.), avisamos
         # con un mensaje claro y cortamos el programa en vez de romper con
@@ -1085,6 +1590,7 @@ def main():
         print("otra aplicación, y que el sistema tenga permitido el acceso a")
         print("la cámara. Si tenés varias cámaras, probá otro valor en la")
         print("constante CAMARA_INDICE.")
+        detector_facial.close()
         return
 
     # Momento en que empezó la racha actual de "ojos cerrados" (None si los
@@ -1098,138 +1604,291 @@ def main():
     # contador de tiempo no se reinicia por oscilaciones del EAR en el límite.
     ojos_cerrados_estado = False
 
-    # Referencia al hilo del pitido de alarma, para no lanzar varios pitidos
-    # superpuestos al mismo tiempo.
-    hilo_alarma = None
+    # Alarma (buzzer en la Pi, parlantes en la PC, o solo visual si ninguno
+    # funciona). Nunca bloquea el bucle: los pitidos suenan en otro hilo.
+    alarma = Alarma()
 
     # Momento del último cabeceo brusco confirmado (None si no hubo, o si ya
     # pasó su tiempo en pantalla). El cartel se mantiene visible unos
     # segundos porque el cabeceo es un evento instantáneo.
     momento_alerta_cabeceo = None
 
+    # Estado anterior de cada alerta, para imprimir en consola solo cuando
+    # EMPIEZA o TERMINA (y no una línea por cada frame).
+    alerta_ojos_antes = False
+    alerta_cabeza_antes = False
+    hay_rostro_antes = None
+    calibrando_antes = True
+
     # Contador que le pasamos a MediaPipe como "marca de tiempo" de cada
     # frame. Solo sirve para que MediaPipe ordene los cuadros; no se usa para
     # ninguna medición de la lógica de detección.
     contador_timestamp_ms = 0
 
-    print("Detector de somnolencia iniciado.")
-    print(f"Calibrando la pose de la cabeza durante {CALIBRACION_SEGUNDOS:.0f} "
-          f"segundos: mirá al frente y quedate quieto.")
-    print("Presioná 'q' para salir, 'c' para volver a calibrar la pose.")
+    # Desde acá la cámara se lee en su propio hilo (ver CapturaEnHilo): el
+    # bucle siempre toma el cuadro más reciente y nunca uno atrasado.
+    camara = CapturaEnHilo(captura)
+    numero_procesado = 0   # número del último cuadro que procesamos
 
-    while True:
-        # Leemos un frame (una imagen) de la cámara. Este 'frame_crudo' NO se
-        # espeja: toda la detección (MediaPipe, EAR, pose) trabaja sobre él.
-        ret, frame_crudo = captura.read()
-        if not ret:
-            # 'ret' es False si por algún motivo no se pudo leer un frame
-            # (por ejemplo, la cámara se desconectó a mitad de la ejecución).
-            print("ERROR: se perdió la conexión con la cámara.")
-            break
+    # Estadísticas de rendimiento, que se imprimen cada 5 segundos.
+    SEGUNDOS_ENTRE_ESTADISTICAS = 5.0
+    momento_estadisticas = time.time()
+    leidos_antes = 0
+    procesados = 0
+    tiempo_procesando = 0.0
+    # Mínimos de la ventana de 5 s, para ajustar los umbrales desde la
+    # consola: un parpadeo o una cabeceada duran menos de 5 s, así que el
+    # valor "actual" solo no alcanza para verlos.
+    ear_minimo = None
+    desv_minima = None
+    vel_minima = None
 
-        # Momento actual, en segundos. TODA la lógica temporal usa esto.
-        ahora = time.time()
+    # En modo sin ventana, los comandos se escriben en la consola.
+    comandos = queue.Queue()
+    if not mostrar_ventana and sys.stdin is not None and sys.stdin.isatty():
+        threading.Thread(target=escuchar_teclado, args=(comandos,),
+                         daemon=True).start()
 
-        contador_timestamp_ms += 1
-        ear_promedio, pose, puntos_ojo_izq, puntos_ojo_der = procesar_frame(
-            frame_crudo, detector_facial, contador_timestamp_ms
-        )
+    log("Detector de somnolencia iniciado"
+        + (" (modo sin ventana)." if not mostrar_ventana else "."))
+    log(f"Calibrando la pose de la cabeza durante {CALIBRACION_SEGUNDOS:.0f} "
+        f"segundos: mirá al frente y quedate quieto.")
+    if mostrar_ventana:
+        print("Presioná 'q' para salir.")
+    else:
+        print("Escribí 'c' + Enter para volver a calibrar la pose. "
+              "Ctrl+C (o 'q' + Enter) para salir.")
 
-        # A partir de acá trabajamos sobre 'lienzo': la copia ESPEJADA que se
-        # muestra en pantalla (efecto espejo, más natural para mirarse). Es
-        # solo visual; la detección ya se hizo sobre el frame crudo.
-        lienzo = cv2.flip(frame_crudo, 1)
-        ancho_lienzo = lienzo.shape[1]
+    try:
+        while True:
+            # Tomamos el cuadro MÁS RECIENTE de la cámara (esperando si
+            # todavía no llegó uno nuevo). Con --saltar N se espera a que la
+            # cámara haya entregado N cuadros desde el último procesado.
+            # Este 'frame_crudo' NO se espeja: toda la detección (MediaPipe,
+            # EAR, pose) trabaja sobre él.
+            #
+            # 'ahora' es el momento en que la cámara capturó el cuadro, en
+            # segundos (time.time()). TODA la lógica temporal usa esto.
+            numero, frame_crudo, ahora = camara.esperar_cuadro_nuevo(
+                numero_procesado,
+                numero_minimo=numero_procesado + argumentos.saltar)
+            if numero is None:
+                if camara.perdida:
+                    # La cámara dejó de entregar cuadros (por ejemplo, se
+                    # desconectó a mitad de la ejecución).
+                    log("ERROR: se perdió la conexión con la cámara.")
+                    break
+                continue  # todavía no llegó un cuadro nuevo; seguimos esperando
+            numero_procesado = numero
+            inicio_proceso = time.time()
 
-        # ==================================================================
-        # SEÑAL 1: OJOS CERRADOS (EAR)
-        # ==================================================================
-        if ear_promedio is None:
-            # No se detectó ninguna cara. Cortamos la racha de ojos cerrados
-            # para no arrastrar una que en realidad es "la cara salió de
-            # cuadro", y avisamos en pantalla.
-            tiempo_ojos_cerrados_inicio = None
-            segundos_ojos_cerrados = 0.0
-            ojos_cerrados_estado = False
-            cv2.putText(lienzo, "No se detecta rostro", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
-        else:
-            # Dibujamos los puntos de cada ojo (con la x espejada, porque los
-            # puntos vienen en coordenadas del frame crudo y el lienzo está
-            # espejado).
-            for (x, y) in puntos_ojo_izq + puntos_ojo_der:
-                cv2.circle(lienzo, (ancho_lienzo - 1 - x, y), 2, (0, 255, 0), -1)
+            contador_timestamp_ms += 1
+            ear_promedio, pose, puntos_ojo_izq, puntos_ojo_der = procesar_frame(
+                frame_crudo, detector_facial, contador_timestamp_ms
+            )
 
-            # Histéresis: entrar en "ojos cerrados" con EAR < umbral, salir
-            # recién cuando el EAR supera umbral + EAR_HISTERESIS.
-            if not ojos_cerrados_estado and ear_promedio < EAR_THRESHOLD:
-                ojos_cerrados_estado = True
-            elif ojos_cerrados_estado and ear_promedio > EAR_THRESHOLD + EAR_HISTERESIS:
-                ojos_cerrados_estado = False
+            # A partir de acá dibujamos sobre 'lienzo': la copia ESPEJADA que
+            # se muestra en pantalla (efecto espejo, más natural para
+            # mirarse). Es solo visual; la detección ya se hizo sobre el
+            # frame crudo. Sin ventana no hay nada que dibujar: 'lienzo'
+            # queda en None y nos ahorramos ese trabajo.
+            lienzo = cv2.flip(frame_crudo, 1) if mostrar_ventana else None
 
-            if ojos_cerrados_estado:
-                # Si es el comienzo de la racha anotamos el momento; si ya
-                # venía, medimos cuánto lleva (con el reloj, no con frames).
-                if tiempo_ojos_cerrados_inicio is None:
-                    tiempo_ojos_cerrados_inicio = ahora
-                segundos_ojos_cerrados = ahora - tiempo_ojos_cerrados_inicio
-            else:
+            hay_rostro = ear_promedio is not None
+            if hay_rostro != hay_rostro_antes:
+                log("Rostro detectado." if hay_rostro else "No se detecta rostro.")
+                hay_rostro_antes = hay_rostro
+
+            # ==============================================================
+            # SEÑAL 1: OJOS CERRADOS (EAR)
+            # ==============================================================
+            alerta_ojos = False
+            if ear_promedio is None:
+                # No se detectó ninguna cara. Cortamos la racha de ojos
+                # cerrados para no arrastrar una que en realidad es "la cara
+                # salió de cuadro", y avisamos en pantalla.
                 tiempo_ojos_cerrados_inicio = None
                 segundos_ojos_cerrados = 0.0
-
-            if segundos_ojos_cerrados >= DROWSY_TIME_SECONDS:
-                dibujar_alerta_ojos(lienzo)
-                hilo_alarma = disparar_alarma_si_corresponde(hilo_alarma)
-
-        # ==================================================================
-        # SEÑAL 2: CABECEOS (POSE DE LA CABEZA)
-        # ==================================================================
-        # Independiente de los ojos: se calcula siempre que haya una pose
-        # válida, aunque el EAR de ese frame haya fallado.
-        if pose is not None:
-            cabeza_caida, cabeceo_brusco = detector_cabeceos.procesar(pose, ahora)
-
-            if cabeza_caida:
-                dibujar_alerta_cabeza_caida(lienzo)
-                hilo_alarma = disparar_alarma_si_corresponde(hilo_alarma)
-
-            if cabeceo_brusco:
-                print("ALERTA: cabeceo brusco detectado.")
-                momento_alerta_cabeceo = ahora
-                hilo_alarma = disparar_alarma_si_corresponde(hilo_alarma)
-
-        # Mantenemos el cartel de cabeceo unos segundos después del evento.
-        if momento_alerta_cabeceo is not None:
-            if (ahora - momento_alerta_cabeceo) < DURACION_ALERTA_CABECEO_SEG:
-                dibujar_alerta_cabeceo(lienzo)
+                ojos_cerrados_estado = False
+                if lienzo is not None:
+                    cv2.putText(lienzo, "No se detecta rostro", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2,
+                                cv2.LINE_AA)
             else:
-                momento_alerta_cabeceo = None
+                # Dibujamos los puntos de cada ojo (con la x espejada, porque
+                # los puntos vienen en coordenadas del frame crudo y el lienzo
+                # está espejado).
+                if lienzo is not None:
+                    ancho_lienzo = lienzo.shape[1]
+                    for (x, y) in puntos_ojo_izq + puntos_ojo_der:
+                        cv2.circle(lienzo, (ancho_lienzo - 1 - x, y), 2,
+                                   (0, 255, 0), -1)
 
-        # Info en vivo para calibrar (EAR y pitch en pantalla).
-        dibujar_hud(lienzo, ear_promedio, segundos_ojos_cerrados, detector_cabeceos)
+                # Histéresis: entrar en "ojos cerrados" con EAR < umbral,
+                # salir recién cuando el EAR supera umbral + EAR_HISTERESIS.
+                if not ojos_cerrados_estado and ear_promedio < EAR_THRESHOLD:
+                    ojos_cerrados_estado = True
+                elif ojos_cerrados_estado and ear_promedio > EAR_THRESHOLD + EAR_HISTERESIS:
+                    ojos_cerrados_estado = False
 
-        # Mostramos el lienzo (imagen espejada) en una ventana.
-        cv2.imshow("Detector de Somnolencia", lienzo)
+                if ojos_cerrados_estado:
+                    # Si es el comienzo de la racha anotamos el momento; si ya
+                    # venía, medimos cuánto lleva (con el reloj, no con
+                    # frames).
+                    if tiempo_ojos_cerrados_inicio is None:
+                        tiempo_ojos_cerrados_inicio = ahora
+                    segundos_ojos_cerrados = ahora - tiempo_ojos_cerrados_inicio
+                else:
+                    tiempo_ojos_cerrados_inicio = None
+                    segundos_ojos_cerrados = 0.0
 
-        # Esperamos 1 milisegundo a que se presione una tecla. El '& 0xFF' es
-        # una forma estándar de comparar la tecla en distintos sistemas
-        # operativos.
-        tecla = cv2.waitKey(1) & 0xFF
-        if tecla == ord('q'):
-            print("Saliendo del programa...")
-            break
-        if tecla == ord('c'):
-            detector_cabeceos.recalibrar()
-            print("Recalibrando la pose de la cabeza: mirá al frente y "
-                  "quedate quieto.")
+                if segundos_ojos_cerrados >= DROWSY_TIME_SECONDS:
+                    alerta_ojos = True
+                    if lienzo is not None:
+                        dibujar_alerta_ojos(lienzo)
+                    alarma.disparar(NIVEL_PELIGRO)
 
-    # --- Liberamos los recursos antes de terminar ---
-    # Muy importante: si no liberamos la cámara, puede quedar "ocupada" y
-    # otras aplicaciones (o el propio programa, si lo volvés a correr) no
-    # van a poder usarla hasta reiniciar la computadora.
-    captura.release()
-    cv2.destroyAllWindows()
-    detector_facial.close()
+            if alerta_ojos != alerta_ojos_antes:
+                log("ALERTA: OJOS CERRADOS." if alerta_ojos
+                    else "Fin de alerta: ojos abiertos.")
+                alerta_ojos_antes = alerta_ojos
+
+            # ==============================================================
+            # SEÑAL 2: CABECEOS (POSE DE LA CABEZA)
+            # ==============================================================
+            # Independiente de los ojos: se calcula siempre que haya una pose
+            # válida, aunque el EAR de ese frame haya fallado.
+            alerta_cabeza = False
+            if pose is not None:
+                cabeza_caida, cabeceo_brusco = detector_cabeceos.procesar(pose, ahora)
+
+                if cabeza_caida:
+                    alerta_cabeza = True
+                    if lienzo is not None:
+                        dibujar_alerta_cabeza_caida(lienzo)
+                    alarma.disparar(NIVEL_PELIGRO)
+
+                if cabeceo_brusco:
+                    log("ALERTA: cabeceo brusco detectado.")
+                    momento_alerta_cabeceo = ahora
+                    alarma.disparar(NIVEL_AVISO)
+
+            if alerta_cabeza != alerta_cabeza_antes:
+                log("ALERTA: CABEZA CAIDA." if alerta_cabeza
+                    else "Fin de alerta: cabeza levantada.")
+                alerta_cabeza_antes = alerta_cabeza
+
+            # La calibración imprime su propio resultado; acá solo marcamos
+            # cuándo se termina, con hora, para seguirlo en la consola.
+            if calibrando_antes and not detector_cabeceos.calibrando:
+                log("Calibración terminada: detección de cabeceos activa.")
+            calibrando_antes = detector_cabeceos.calibrando
+
+            # Mantenemos el cartel de cabeceo unos segundos después del evento.
+            if momento_alerta_cabeceo is not None:
+                if (ahora - momento_alerta_cabeceo) < DURACION_ALERTA_CABECEO_SEG:
+                    if lienzo is not None:
+                        dibujar_alerta_cabeceo(lienzo)
+                else:
+                    momento_alerta_cabeceo = None
+
+            # --- Valores en vivo para la consola (mínimos de la ventana) ---
+            if ear_promedio is not None:
+                ear_minimo = (ear_promedio if ear_minimo is None
+                              else min(ear_minimo, ear_promedio))
+            if pose is not None and not detector_cabeceos.calibrando:
+                desv = detector_cabeceos.desviacion
+                vel = detector_cabeceos.ultima_velocidad
+                desv_minima = desv if desv_minima is None else min(desv_minima, desv)
+                vel_minima = vel if vel_minima is None else min(vel_minima, vel)
+
+            # --- Rendimiento: FPS de captura y de procesamiento ---
+            procesados += 1
+            tiempo_procesando += time.time() - inicio_proceso
+            transcurrido = time.time() - momento_estadisticas
+            if transcurrido >= SEGUNDOS_ENTRE_ESTADISTICAS:
+                leidos = camara.cuadros_leidos
+                fps_captura = (leidos - leidos_antes) / transcurrido
+                fps_proceso = procesados / transcurrido
+                ms_por_cuadro = 1000.0 * tiempo_procesando / procesados
+                atraso_ms = 1000.0 * (time.time() - ahora)
+                log(f"FPS captura: {fps_captura:.1f} | FPS procesamiento: "
+                    f"{fps_proceso:.1f} | {ms_por_cuadro:.0f} ms por cuadro | "
+                    f"atraso del último cuadro: {atraso_ms:.0f} ms")
+                # Segunda línea: valores de detección (actual y mínimo de
+                # estos 5 s) para comparar con los umbrales sin ventana.
+                if ear_promedio is not None:
+                    texto_ear = f"EAR {ear_promedio:.3f}"
+                else:
+                    texto_ear = "EAR --"
+                if ear_minimo is not None:
+                    texto_ear += f" (mín {ear_minimo:.3f}, umbral {EAR_THRESHOLD:.2f})"
+                if detector_cabeceos.calibrando:
+                    texto_pose = "pose: calibrando..."
+                elif desv_minima is None:
+                    texto_pose = "pose: --"
+                else:
+                    texto_pose = (
+                        f"desv {detector_cabeceos.desviacion:+.1f}° (mín "
+                        f"{desv_minima:+.1f}°, umbral {-CABEZA_CAIDA_GRADOS:+.1f}°) | "
+                        f"vel {detector_cabeceos.ultima_velocidad:+.0f}°/s (mín "
+                        f"{vel_minima:+.0f}°/s, umbral "
+                        f"{-CABECEO_VELOCIDAD_GRADOS_POR_SEG:+.0f}°/s)")
+                log(f"  {texto_ear} | {texto_pose}")
+                ear_minimo = desv_minima = vel_minima = None
+                momento_estadisticas = time.time()
+                leidos_antes = leidos
+                procesados = 0
+                tiempo_procesando = 0.0
+
+            # --- Teclas / comandos ---
+            tecla = None
+            if mostrar_ventana:
+                # Info en vivo para calibrar (EAR y pitch en pantalla).
+                dibujar_hud(lienzo, ear_promedio, segundos_ojos_cerrados,
+                            detector_cabeceos)
+                # Mostramos el lienzo (imagen espejada) en una ventana.
+                cv2.imshow("Detector de Somnolencia", lienzo)
+                # Esperamos 1 milisegundo a que se presione una tecla. El
+                # '& 0xFF' es una forma estándar de comparar la tecla en
+                # distintos sistemas operativos.
+                codigo = cv2.waitKey(1) & 0xFF
+                if codigo != 0xFF:
+                    tecla = chr(codigo)
+            else:
+                try:
+                    tecla = comandos.get_nowait()
+                except queue.Empty:
+                    pass
+
+            if tecla == "q":
+                log("Saliendo del programa...")
+                break
+            # Recalibrar a mano solo en modo sin ventana ('c' + Enter). Con
+            # ventana, por ahora, la calibración es solo automática.
+            if tecla == "c" and not mostrar_ventana:
+                detector_cabeceos.recalibrar()
+                calibrando_antes = True
+                log("Recalibrando la pose de la cabeza: mirá al frente y "
+                    "quedate quieto.")
+
+    except KeyboardInterrupt:
+        # Ctrl+C: no es un error, es la forma normal de salir sin ventana.
+        print()
+        log("Ctrl+C: saliendo del programa...")
+
+    finally:
+        # --- Liberamos los recursos antes de terminar ---
+        # Muy importante: si no liberamos la cámara, puede quedar "ocupada"
+        # y otras aplicaciones (o el propio programa, si lo volvés a correr)
+        # no van a poder usarla. Esto se hace SIEMPRE, se salga como se
+        # salga (q, Ctrl+C o un error).
+        alarma.cerrar()  # en la Pi, deja el buzzer apagado sí o sí
+        camara.detener()  # frena el hilo de captura y libera la cámara
+        if mostrar_ventana:
+            cv2.destroyAllWindows()
+        detector_facial.close()
+        log("Recursos liberados. Chau.")
 
 
 # Este bloque hace que 'main()' se ejecute solo cuando corrés este archivo
