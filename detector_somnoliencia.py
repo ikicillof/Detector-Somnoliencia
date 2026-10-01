@@ -165,25 +165,47 @@ import numpy as np    # NumPy: distancias entre puntos, y el ajuste de recta
 CAMARA_INDICE = 0
 
 # --- Ojos cerrados (EAR) ---
-# Umbral de EAR: por debajo de este valor consideramos que el ojo está cerrado.
-# Varía según la persona, el ángulo de la cámara y la iluminación. Si dispara
-# la alarma con los ojos abiertos, BAJALO. Si no detecta cuando cerrás los
-# ojos, SUBILO.
-#
-# Estaba en 0.22 (valor típico). Se bajó a 0.18 porque a una persona con
-# ojos rasgados/achinados la marcaba con los ojos cerrados teniéndolos
-# abiertos: sus ojos abiertos dan un EAR más bajo que el promedio. Ojo: con la
-# histéresis, para volver a contar como "abiertos" el EAR tiene que superar
-# EAR_THRESHOLD + EAR_HISTERESIS (0.20).
-EAR_THRESHOLD = 0.18
+# El umbral de EAR (por debajo de él, el ojo cuenta como cerrado) se CALIBRA
+# SOLO PARA CADA PERSONA al arrancar: se mide su EAR con los ojos abiertos y
+# el umbral queda en EAR_FRACCION_UMBRAL de ese valor (ver CalibradorEAR).
+# Así funciona igual con ojos grandes que con ojos rasgados/achinados.
+
+# Umbral de RESPALDO: el que se usa durante los primeros segundos, mientras
+# todavía no terminó la calibración de los ojos. Es BAJO a propósito: tiene
+# que detectar ojos realmente cerrados (EAR ~0.05-0.10) sin marcar como
+# cerrados unos ojos achinados abiertos (EAR ~0.15-0.20) antes de calibrar.
+# Así, aunque la calibración no termine (por ejemplo, si el conductor ya
+# arranca con los ojos cerrados), la alarma de ojos funciona igual.
+EAR_THRESHOLD = 0.12
+
+# Segundos que se mide el EAR con los ojos abiertos al arrancar (y al
+# recalibrar). Rango razonable: 2.0 a 5.0 s.
+EAR_CALIBRACION_SEGUNDOS = 3.0
+
+# Qué fracción del EAR con ojos abiertos se usa como umbral. 0.70 = el ojo
+# cuenta como cerrado cuando se cierra un 30 % respecto de lo normal para esa
+# persona (con EAR abierto 0.30 da 0.21; con 0.20 da 0.14). Si dispara con los
+# ojos abiertos, BAJALO (p. ej. 0.65); si no detecta los ojos cerrados,
+# SUBILO (p. ej. 0.75). Rango razonable: 0.60 a 0.80.
+EAR_FRACCION_UMBRAL = 0.70
+
+# Límites de seguridad para el umbral calibrado, por si la medición sale
+# rara. Rango razonable: mínimo 0.10-0.14, máximo 0.24-0.28.
+EAR_UMBRAL_MINIMO = 0.12
+EAR_UMBRAL_MAXIMO = 0.26
+
+# Si el EAR medido "con ojos abiertos" da menos que esto, seguramente la
+# persona tenía los ojos cerrados o entrecerrados al calibrar: se descarta y
+# se reintenta sola. Rango razonable: 0.13 a 0.17.
+EAR_ABIERTO_MINIMO = 0.15
 
 # Cuántos SEGUNDOS seguidos con los ojos por debajo del umbral se consideran
 # somnolencia real y no un simple parpadeo. Rango razonable: 1.0 a 3.0 s.
 DROWSY_TIME_SECONDS = 2.0
 
 # Histéresis del EAR. Una vez que el ojo cuenta como "cerrado" (EAR por
-# debajo de EAR_THRESHOLD), no vuelve a contar como "abierto" hasta que el
-# EAR sube por encima de EAR_THRESHOLD + este margen. Sirve para que el
+# debajo del umbral), no vuelve a contar como "abierto" hasta que el
+# EAR sube por encima del umbral + este margen. Sirve para que el
 # contador de tiempo no se reinicie por oscilaciones del EAR justo en el
 # límite (si no, con los ojos entornados la alerta nunca llegaría a los 2 s).
 # Rango razonable: 0.01 a 0.04.
@@ -541,6 +563,75 @@ def estimar_pose(landmarks, ancho_frame, alto_frame):
     proxy = (nariz.y - ojos_medio_y) / interocular if interocular > 1e-6 else 0.0
 
     return PoseCabeza(pitch=pitch, yaw=yaw, proxy=proxy)
+
+
+# ==============================================================================
+# CALIBRACIÓN DEL UMBRAL DE OJOS POR PERSONA
+# ==============================================================================
+#
+# ¿POR QUÉ CALIBRAR EL UMBRAL DE LOS OJOS?
+# El EAR con los ojos ABIERTOS no es igual para todos: una persona con ojos
+# grandes puede tener 0.32, y una con ojos rasgados/achinados, 0.20. Con un
+# umbral fijo (por ejemplo 0.22) a la segunda la marcaría con los ojos
+# cerrados teniéndolos abiertos; y si lo bajamos mucho para ella, a la
+# primera le costaría detectar los ojos cerrados.
+#
+# La solución: al arrancar (mientras se calibra la cabeza, mirando al
+# frente), se mide el EAR de ESTA persona con los ojos abiertos y el umbral
+# queda en un porcentaje de ese valor (EAR_FRACCION_UMBRAL). Así cada uno
+# tiene su propio umbral. Hasta que termina, se usa EAR_THRESHOLD.
+
+class CalibradorEAR:
+    """Mide el EAR de la persona con los ojos abiertos y calcula su umbral.
+
+    Uso: en cada cuadro con cara se llama a 'procesar(ear, ahora)'. Mientras
+    calibra, 'umbral' vale EAR_THRESHOLD (el de respaldo); cuando termina,
+    'umbral' pasa a ser el de esta persona y 'procesar' devuelve True una
+    sola vez. 'reiniciar()' vuelve a empezar (por ejemplo, si cambia el
+    conductor)."""
+
+    def __init__(self):
+        self.reiniciar()
+
+    def reiniciar(self):
+        self.umbral = EAR_THRESHOLD
+        self.ear_abierto = None
+        self.calibrado = False
+        self._muestras = []
+        self._tiempo_arranque = None
+
+    def procesar(self, ear, ahora):
+        """Suma una muestra de EAR. Devuelve True justo en el cuadro en que
+        la calibración termina bien."""
+        if self.calibrado:
+            return False
+        if self._tiempo_arranque is None:
+            self._tiempo_arranque = ahora
+        self._muestras.append(ear)
+        if (ahora - self._tiempo_arranque < EAR_CALIBRACION_SEGUNDOS
+                or len(self._muestras) < 5):
+            return False
+
+        # Usamos la MEDIANA (el valor del medio) y no el promedio: si la
+        # persona parpadea durante la calibración, esos pocos valores bajos
+        # casi no la mueven.
+        abierto = float(np.median(self._muestras))
+        if abierto < EAR_ABIERTO_MINIMO:
+            # Demasiado bajo para ser ojos abiertos: seguramente los tenía
+            # cerrados o entrecerrados. Se reintenta solo.
+            print(f"Calibracion de ojos: EAR muy bajo ({abierto:.3f}), parecen "
+                  f"cerrados. Reintentando: mira a la camara con los ojos "
+                  f"abiertos normalmente.")
+            self._muestras = []
+            self._tiempo_arranque = ahora
+            return False
+
+        umbral = abierto * EAR_FRACCION_UMBRAL
+        umbral = min(max(umbral, EAR_UMBRAL_MINIMO), EAR_UMBRAL_MAXIMO)
+        self.ear_abierto = abierto
+        self.umbral = umbral
+        self.calibrado = True
+        return True
 
 
 # ==============================================================================
@@ -1294,7 +1385,8 @@ def dibujar_alerta_cabeceo(frame):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
 
 
-def dibujar_hud(frame, ear_promedio, segundos_ojos_cerrados, detector_cabeceos):
+def dibujar_hud(frame, ear_promedio, segundos_ojos_cerrados, detector_cabeceos,
+                calibrador_ear):
     """Muestra en pantalla, abajo a la izquierda, los valores en vivo (EAR,
     pitch crudo y suavizado, desviación, velocidad, temporizadores). No hace
     falta para que la alarma funcione: es para poder CALIBRAR los umbrales
@@ -1308,7 +1400,9 @@ def dibujar_hud(frame, ear_promedio, segundos_ojos_cerrados, detector_cabeceos):
 
     # Línea 1: EAR y cuánto tiempo llevan los ojos cerrados.
     if ear_promedio is not None:
-        texto_ear = (f"EAR: {ear_promedio:.3f} (umbral {EAR_THRESHOLD:.2f})   "
+        estado_umbral = "" if calibrador_ear.calibrado else ", calibrando"
+        texto_ear = (f"EAR: {ear_promedio:.3f} (umbral {calibrador_ear.umbral:.3f}"
+                     f"{estado_umbral})   "
                      f"ojos cerrados: {segundos_ojos_cerrados:.1f}s"
                      f" / {DROWSY_TIME_SECONDS:.1f}s")
     else:
@@ -1620,6 +1714,9 @@ def main():
     # --- Detector de cabeceos (pose de la cabeza) ---
     detector_cabeceos = DetectorCabeceos()
 
+    # --- Umbral de ojos cerrados, calibrado para esta persona ---
+    calibrador_ear = CalibradorEAR()
+
     # --- Abrimos la webcam ---
     captura = abrir_camara(CAMARA_INDICE, argumentos.ancho, argumentos.alto)
 
@@ -1642,9 +1739,9 @@ def main():
     tiempo_ojos_cerrados_inicio = None
     segundos_ojos_cerrados = 0.0
 
-    # Estado "ojos cerrados" con histéresis: se entra con EAR < EAR_THRESHOLD
-    # y se sale recién con EAR > EAR_THRESHOLD + EAR_HISTERESIS, así el
-    # contador de tiempo no se reinicia por oscilaciones del EAR en el límite.
+    # Estado "ojos cerrados" con histéresis: se entra con EAR < umbral y se
+    # sale recién con EAR > umbral + EAR_HISTERESIS, así el contador de
+    # tiempo no se reinicia por oscilaciones del EAR en el límite.
     ojos_cerrados_estado = False
 
     # Alarma (buzzer en la Pi, parlantes en la PC, o solo visual si ninguno
@@ -1697,8 +1794,9 @@ def main():
 
     log("Detector de somnolencia iniciado"
         + (" (modo sin ventana)." if not mostrar_ventana else "."))
-    log(f"Calibrando la pose de la cabeza durante {CALIBRACION_SEGUNDOS:.0f} "
-        f"segundos: mirá al frente y quedate quieto.")
+    log(f"Calibrando la pose de la cabeza y el umbral de los ojos durante "
+        f"{max(CALIBRACION_SEGUNDOS, EAR_CALIBRACION_SEGUNDOS):.0f} segundos: "
+        f"mirá al frente, con los ojos abiertos normalmente, y quedate quieto.")
     if mostrar_ventana:
         print("Presioná 'q' para salir.")
     else:
@@ -1782,11 +1880,19 @@ def main():
                         cv2.circle(lienzo, (ancho_lienzo - 1 - x, y), 2,
                                    (0, 255, 0), -1)
 
+                # Umbral de ESTA persona: se calibra solo al arrancar (hasta
+                # entonces vale EAR_THRESHOLD).
+                if calibrador_ear.procesar(ear_promedio, ahora):
+                    log(f"Ojos calibrados: EAR con ojos abiertos "
+                        f"{calibrador_ear.ear_abierto:.3f} -> umbral "
+                        f"{calibrador_ear.umbral:.3f}.")
+                umbral_ear = calibrador_ear.umbral
+
                 # Histéresis: entrar en "ojos cerrados" con EAR < umbral,
                 # salir recién cuando el EAR supera umbral + EAR_HISTERESIS.
-                if not ojos_cerrados_estado and ear_promedio < EAR_THRESHOLD:
+                if not ojos_cerrados_estado and ear_promedio < umbral_ear:
                     ojos_cerrados_estado = True
-                elif ojos_cerrados_estado and ear_promedio > EAR_THRESHOLD + EAR_HISTERESIS:
+                elif ojos_cerrados_estado and ear_promedio > umbral_ear + EAR_HISTERESIS:
                     ojos_cerrados_estado = False
 
                 if ojos_cerrados_estado:
@@ -1881,7 +1987,8 @@ def main():
                 else:
                     texto_ear = "EAR --"
                 if ear_minimo is not None:
-                    texto_ear += f" (mín {ear_minimo:.3f}, umbral {EAR_THRESHOLD:.2f})"
+                    texto_ear += (f" (mín {ear_minimo:.3f}, umbral "
+                                  f"{calibrador_ear.umbral:.3f})")
                 if detector_cabeceos.calibrando:
                     texto_pose = "pose: calibrando..."
                 elif desv_minima is None:
@@ -1905,7 +2012,7 @@ def main():
             if mostrar_ventana:
                 # Info en vivo para calibrar (EAR y pitch en pantalla).
                 dibujar_hud(lienzo, ear_promedio, segundos_ojos_cerrados,
-                            detector_cabeceos)
+                            detector_cabeceos, calibrador_ear)
                 # Mostramos el lienzo (imagen espejada) en una ventana.
                 cv2.imshow("Detector de Somnolencia", lienzo)
                 # Esperamos 1 milisegundo a que se presione una tecla. El
@@ -1927,9 +2034,11 @@ def main():
             # ventana, por ahora, la calibración es solo automática.
             if tecla == "c" and not mostrar_ventana:
                 detector_cabeceos.recalibrar()
+                calibrador_ear.reiniciar()
                 calibrando_antes = True
-                log("Recalibrando la pose de la cabeza: mirá al frente y "
-                    "quedate quieto.")
+                log("Recalibrando la pose de la cabeza y el umbral de los "
+                    "ojos: mirá al frente, con los ojos abiertos normalmente, "
+                    "y quedate quieto.")
 
     except KeyboardInterrupt:
         # Ctrl+C: no es un error, es la forma normal de salir sin ventana.
