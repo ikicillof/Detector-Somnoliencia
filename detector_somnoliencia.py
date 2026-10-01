@@ -166,10 +166,16 @@ CAMARA_INDICE = 0
 
 # --- Ojos cerrados (EAR) ---
 # Umbral de EAR: por debajo de este valor consideramos que el ojo está cerrado.
-# 0.22 es un valor típico, pero varía según la persona, el ángulo de la cámara
-# y la iluminación. Si dispara la alarma con los ojos abiertos, bajalo (p. ej.
-# 0.18). Si no detecta cuando cerrás los ojos, subilo (p. ej. 0.25).
-EAR_THRESHOLD = 0.22
+# Varía según la persona, el ángulo de la cámara y la iluminación. Si dispara
+# la alarma con los ojos abiertos, BAJALO. Si no detecta cuando cerrás los
+# ojos, SUBILO.
+#
+# Estaba en 0.22 (valor típico). Se bajó a 0.18 porque a una persona con
+# ojos rasgados/achinados la marcaba con los ojos cerrados teniéndolos
+# abiertos: sus ojos abiertos dan un EAR más bajo que el promedio. Ojo: con la
+# histéresis, para volver a contar como "abiertos" el EAR tiene que superar
+# EAR_THRESHOLD + EAR_HISTERESIS (0.20).
+EAR_THRESHOLD = 0.18
 
 # Cuántos SEGUNDOS seguidos con los ojos por debajo del umbral se consideran
 # somnolencia real y no un simple parpadeo. Rango razonable: 1.0 a 3.0 s.
