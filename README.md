@@ -109,9 +109,9 @@ cantidad de cuadros. Los principales:
 
 **Ojos:**
 
-- `EAR_THRESHOLD` (por defecto `0.22`): si dispara con los ojos abiertos,
-  bajalo (p. ej. `0.18`); si no detecta con los ojos cerrados, subilo
-  (p. ej. `0.25`).
+- `EAR_THRESHOLD` (por defecto `0.18`): si dispara con los ojos abiertos,
+  bajalo (p. ej. `0.15`); si no detecta con los ojos cerrados, subilo
+  (p. ej. `0.22`).
 - `DROWSY_TIME_SECONDS` (por defecto `2.0`): segundos de ojos cerrados
   seguidos que cuentan como somnolencia.
 

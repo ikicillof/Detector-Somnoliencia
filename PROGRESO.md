@@ -81,6 +81,12 @@ En modo solo visual no imprime nada extra.
 Además, ahora un pedido de mayor prioridad corta al instante el patrón de
 menor prioridad que esté sonando, para que una alerta nunca espere.
 
+**Umbral de ojos:** `EAR_THRESHOLD` bajó de 0.22 a 0.18 (pedido explícito):
+a un compañero con ojos achinados lo marcaba como ojos cerrados con los ojos
+abiertos. Pendiente: verificar con su EAR real (valor en pantalla o en la
+línea de consola de cada 5 s) y evaluar un umbral que se calibre solo por
+persona.
+
 ### Cómo se probó
 
 - Alarma, modo sin ventana, captura en hilo, argumentos y `vcgencmd`:
