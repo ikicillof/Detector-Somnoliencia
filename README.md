@@ -17,8 +17,14 @@ Vigila dos cosas al mismo tiempo:
    - **Cabeceo brusco**: la cabeza cae de golpe y se endereza en menos de un
      segundo (se detecta por la velocidad del movimiento, no por la posición).
 
-Cualquiera de las tres condiciones dispara la misma **alarma sonora** y un
-**cartel rojo** en pantalla.
+Cualquiera de las tres condiciones dispara una **alarma sonora** y un
+**cartel rojo** en pantalla. En la PC suena por los parlantes; en la
+Raspberry Pi, por un buzzer conectado a un pin GPIO. Hay dos patrones:
+**peligro** (ojos cerrados o cabeza caída: pitido largo que se repite) y
+**aviso** (cabeceo brusco: dos pitidos cortos).
+
+> **¿Raspberry Pi?** La instalación y el uso en la Pi son distintos: seguí
+> [INSTALACION_PI.md](INSTALACION_PI.md).
 
 > Apenas arranca, el programa se toma unos segundos para **calibrar** la
 > posición neutra de la cabeza: mirá al frente y quedate quieto hasta que
@@ -62,6 +68,18 @@ pip install -r requirements.txt
 python detector_somnoliencia.py
 ```
 
+## Opciones de la línea de comandos
+
+```cmd
+python detector_somnoliencia.py [--sin-ventana] [--ancho 640 --alto 480] [--saltar N]
+```
+
+- `--sin-ventana`: no abre la ventana de video; los eventos y los valores en
+  vivo salen por la consola. Se activa solo en Linux si no hay pantalla.
+- `--ancho` / `--alto`: resolución pedida a la cámara (por defecto, la de la
+  cámara en la PC y 640x480 en la Raspberry Pi).
+- `--saltar N`: procesa 1 de cada N cuadros, si la máquina no da abasto.
+
 ## Controles
 
 - Se abre una ventana con la imagen de la cámara (espejada), los puntos de
@@ -74,8 +92,8 @@ python detector_somnoliencia.py
   de frente, la calibración se descarta y se reintenta sola, todas las veces
   que haga falta, sin tocar ninguna tecla. Mientras tanto la detección de
   ojos cerrados sigue funcionando.
-- Presioná **`q`** con la ventana enfocada para cerrar el programa
-  correctamente.
+- Presioná **`q`** con la ventana enfocada (o `Ctrl+C` en la consola) para
+  cerrar el programa correctamente.
 - En el modo **sin ventana** (`--sin-ventana`), escribí **`c`** + Enter en
   la consola para volver a calibrar la posición neutra de la cabeza (por
   ejemplo si moviste la cámara). Con ventana la calibración es solo
@@ -126,6 +144,9 @@ cantidad de cuadros. Los principales:
   navegador, etc.) y que en **Configuración > Privacidad y seguridad >
   Cámara** de Windows esté permitido el acceso para aplicaciones de
   escritorio.
+- **"ADVERTENCIA: no se pudo usar el sonido"**: falta `sounddevice` o no
+  hay parlantes. El programa sigue con la alarma solo en pantalla. Instalalo
+  con `pip install sounddevice`.
 - **Error al importar `cv2` o `mediapipe`**: significa que las dependencias
   no están instaladas en el entorno de Python activo. Ejecutá de nuevo
   `pip install -r requirements.txt` (asegurándote de tener el entorno
