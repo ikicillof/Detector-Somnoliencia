@@ -101,8 +101,8 @@
 # pitch mientras el conductor mira al frente y guarda eso como "posición
 # neutra". De ahí en más todo se mide como DESVIACIÓN respecto de ese neutro.
 # La calibración se valida (si el conductor se movió o no miraba al frente,
-# se reintenta sola), y se puede rehacer en cualquier momento con la tecla
-# 'c'.
+# se reintenta sola, sin tocar ninguna tecla). En el modo sin ventana además
+# se puede rehacer a mano escribiendo 'c' + Enter en la consola.
 #
 # ¿POR QUÉ TODO SE MIDE EN SEGUNDOS Y NO EN "CUADROS"?
 # -----------------------------------------------------
@@ -1420,7 +1420,7 @@ def main():
     log(f"Calibrando la pose de la cabeza durante {CALIBRACION_SEGUNDOS:.0f} "
         f"segundos: mirá al frente y quedate quieto.")
     if mostrar_ventana:
-        print("Presioná 'q' para salir, 'c' para volver a calibrar la pose.")
+        print("Presioná 'q' para salir.")
     else:
         print("Escribí 'c' + Enter para volver a calibrar la pose. "
               "Ctrl+C (o 'q' + Enter) para salir.")
@@ -1574,7 +1574,9 @@ def main():
             if tecla == "q":
                 log("Saliendo del programa...")
                 break
-            if tecla == "c":
+            # Recalibrar a mano solo en modo sin ventana ('c' + Enter). Con
+            # ventana, por ahora, la calibración es solo automática.
+            if tecla == "c" and not mostrar_ventana:
                 detector_cabeceos.recalibrar()
                 calibrando_antes = True
                 log("Recalibrando la pose de la cabeza: mirá al frente y "

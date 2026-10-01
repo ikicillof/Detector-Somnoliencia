@@ -69,15 +69,17 @@ python detector_somnoliencia.py
   temporizador, **pitch crudo** y **pitch suavizado** por separado,
   desviación respecto del neutro, velocidad angular y el temporizador de
   cabeza caída. Esos números son los que se usan para calibrar los umbrales.
-- Al arrancar (y cada vez que apretás `c`) hay unos segundos de
+- Al arrancar hay unos segundos de
   **calibración**: mirá al frente y quedate quieto. Si te movés o no mirás
   de frente, la calibración se descarta y se reintenta sola, todas las veces
   que haga falta, sin tocar ninguna tecla. Mientras tanto la detección de
   ojos cerrados sigue funcionando.
 - Presioná **`q`** con la ventana enfocada para cerrar el programa
   correctamente.
-- Presioná **`c`** para volver a calibrar la posición neutra de la cabeza
-  (por ejemplo si moviste la cámara o cambiaste de postura).
+- En el modo **sin ventana** (`--sin-ventana`), escribí **`c`** + Enter en
+  la consola para volver a calibrar la posición neutra de la cabeza (por
+  ejemplo si moviste la cámara). Con ventana la calibración es solo
+  automática.
 
 ## Ajustar la sensibilidad
 
