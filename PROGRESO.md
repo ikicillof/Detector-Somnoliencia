@@ -75,6 +75,12 @@ El detector ya corría en la Pi, pero con parches a mano y mucho delay:
 muy corto (`NIVEL_CALIBRADO`, 0,08 s), con menor prioridad que las alertas.
 En modo solo visual no imprime nada extra.
 
+**Tic de rostro perdido:** mientras la cámara no ve la cara (después de
+`SIN_ROSTRO_ESPERA_SEGUNDOS = 1.0`), suena un "tic" de 0,03 s cada ~1,2 s
+(`NIVEL_SIN_ROSTRO`, la prioridad más baja). Se corta apenas vuelve la cara.
+Además, ahora un pedido de mayor prioridad corta al instante el patrón de
+menor prioridad que esté sonando, para que una alerta nunca espere.
+
 ### Cómo se probó
 
 - Alarma, modo sin ventana, captura en hilo, argumentos y `vcgencmd`:
