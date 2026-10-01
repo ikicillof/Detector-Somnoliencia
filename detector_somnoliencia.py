@@ -326,20 +326,32 @@ ALARM_DURATION_MS = 700
 # El GPIO en alto satura el transistor y el buzzer suena.
 BUZZER_GPIO = 21
 
+# Cuántos SEGUNDOS seguidos sin ver la cara antes de empezar con el "tic"
+# de rostro perdido. Evita que suene por un cuadro suelto en el que MediaPipe
+# no encontró la cara (por ejemplo, al girar la cabeza un instante).
+# Rango razonable: 0.5 a 3.0 s.
+SIN_ROSTRO_ESPERA_SEGUNDOS = 1.0
+
 # Patrones de pitidos de cada nivel de alerta, como lista de
 # (segundos_sonando, segundos_en_silencio). Así se distinguen de oído sin
 # mirar la pantalla:
-#   NIVEL_CALIBRADO -> la calibración terminó bien: un pitido muy corto, solo
-#                      para avisar que ya se puede dejar de mirar al frente.
-#                      No es una alerta.
-#   NIVEL_AVISO     -> cabeceo brusco (evento instantáneo): dos pitidos cortos.
-#   NIVEL_PELIGRO   -> ojos cerrados o cabeza caída sostenida: un pitido largo
-#                      que se repite mientras dure la condición.
-# El número indica la prioridad: si se piden dos a la vez, suena el mayor.
-NIVEL_CALIBRADO = 1
-NIVEL_AVISO = 2
-NIVEL_PELIGRO = 3
+#   NIVEL_SIN_ROSTRO -> la cámara no ve la cara: un "tic" cortísimo cada poco
+#                       más de un segundo, mientras no vuelva a verla. Es
+#                       sutil a propósito: avisa, pero no asusta.
+#   NIVEL_CALIBRADO  -> la calibración terminó bien: un pitido muy corto, solo
+#                       para avisar que ya se puede dejar de mirar al frente.
+#                       No es una alerta.
+#   NIVEL_AVISO      -> cabeceo brusco (evento instantáneo): dos pitidos cortos.
+#   NIVEL_PELIGRO    -> ojos cerrados o cabeza caída sostenida: un pitido largo
+#                       que se repite mientras dure la condición.
+# El número indica la prioridad: si se piden dos a la vez, suena el mayor, y
+# un pedido de mayor prioridad CORTA al instante al que esté sonando.
+NIVEL_SIN_ROSTRO = 1
+NIVEL_CALIBRADO = 2
+NIVEL_AVISO = 3
+NIVEL_PELIGRO = 4
 PATRONES_ALARMA = {
+    NIVEL_SIN_ROSTRO: [(0.03, 1.2)],
     NIVEL_CALIBRADO: [(0.08, 0.0)],
     NIVEL_AVISO: [(0.12, 0.08), (0.12, 0.30)],
     NIVEL_PELIGRO: [(ALARM_DURATION_MS / 1000.0, 0.10)],
@@ -1106,6 +1118,7 @@ class Alarma:
         # un "Condition" para despertarlo cuando llega un pedido.
         self._condicion = threading.Condition()
         self._nivel_pedido = 0
+        self._nivel_sonando = 0   # nivel del patrón que suena ahora (0 = nada)
         self._cerrando = False
         # Se activa para interrumpir un patrón a mitad de camino.
         self._cortar = threading.Event()
@@ -1145,15 +1158,16 @@ class Alarma:
         return salida
 
     def disparar(self, nivel):
-        """Pide que suene el patrón de 'nivel' (NIVEL_CALIBRADO, NIVEL_AVISO
-        o NIVEL_PELIGRO).
-        Vuelve al instante. Si ya está sonando un patrón, el pedido queda
-        anotado y se reproduce cuando ese termina; varios pedidos seguidos se
-        juntan en uno solo (gana el nivel más alto). Así, mientras una
-        condición se mantiene, el patrón se repite sin superponerse."""
+        """Pide que suene el patrón de 'nivel' (uno de los NIVEL_...).
+        Vuelve al instante. Si ya está sonando un patrón del mismo nivel o
+        mayor, el pedido queda anotado y se reproduce cuando ese termina;
+        varios pedidos seguidos se juntan en uno solo (gana el nivel más
+        alto). Así, mientras una condición se mantiene, el patrón se repite
+        sin superponerse. Si lo que suena es de MENOR nivel (por ejemplo el
+        "tic" de rostro perdido), se corta para que la alerta suene ya."""
         if self.solo_visual:
-            if nivel == NIVEL_CALIBRADO:
-                return  # no es una alerta; la consola ya avisa la calibración
+            if nivel in (NIVEL_SIN_ROSTRO, NIVEL_CALIBRADO):
+                return  # no son alertas; la consola ya avisa esos eventos
             # Sin sonido: avisamos por consola, como mucho una vez por segundo
             # para no inundarla (el bucle llama a esto en cada frame).
             ahora = time.time()
@@ -1163,15 +1177,25 @@ class Alarma:
             return
         with self._condicion:
             self._nivel_pedido = max(self._nivel_pedido, nivel)
+            if 0 < self._nivel_sonando < nivel:
+                self._cortar.set()
             self._condicion.notify()
 
-    def callar(self):
-        """Corta el patrón que esté sonando y descarta pedidos pendientes."""
+    def callar(self, nivel=None):
+        """Corta el patrón que esté sonando y descarta pedidos pendientes.
+        Si se indica 'nivel', solo calla ESE nivel (por ejemplo, el "tic" de
+        rostro perdido cuando la cara vuelve) y no toca las alertas."""
         if self.solo_visual:
             return
         with self._condicion:
-            self._nivel_pedido = 0
-        self._cortar.set()
+            if nivel is None:
+                self._nivel_pedido = 0
+                self._cortar.set()
+                return
+            if self._nivel_pedido == nivel:
+                self._nivel_pedido = 0
+            if self._nivel_sonando == nivel:
+                self._cortar.set()
 
     def cerrar(self):
         """Apaga la alarma y termina el hilo. Llamar siempre al salir: en la
@@ -1201,6 +1225,7 @@ class Alarma:
                     return
                 nivel = self._nivel_pedido
                 self._nivel_pedido = 0
+                self._nivel_sonando = nivel
                 self._cortar.clear()
             try:
                 self._reproducir(PATRONES_ALARMA[nivel])
@@ -1213,6 +1238,8 @@ class Alarma:
                     self._salida.apagar()
                 except Exception:
                     pass
+                with self._condicion:
+                    self._nivel_sonando = 0
 
     def _reproducir(self, patron):
         """Reproduce un patrón (lista de (sonando, silencio) en segundos).
@@ -1628,6 +1655,9 @@ def main():
     alerta_ojos_antes = False
     alerta_cabeza_antes = False
     hay_rostro_antes = None
+    # Momento desde el que no se ve la cara (None si se ve), para el "tic"
+    # de rostro perdido. Arranca "sin rostro" hasta el primer cuadro con cara.
+    momento_sin_rostro = None
     calibrando_antes = True
 
     # Contador que le pasamos a MediaPipe como "marca de tiempo" de cada
@@ -1708,6 +1738,18 @@ def main():
             if hay_rostro != hay_rostro_antes:
                 log("Rostro detectado." if hay_rostro else "No se detecta rostro.")
                 hay_rostro_antes = hay_rostro
+
+            # "Tic" sutil y continuo mientras no se ve la cara (después de
+            # SIN_ROSTRO_ESPERA_SEGUNDOS, medidos con el reloj).
+            if hay_rostro:
+                if momento_sin_rostro is not None:
+                    momento_sin_rostro = None
+                    alarma.callar(NIVEL_SIN_ROSTRO)
+            else:
+                if momento_sin_rostro is None:
+                    momento_sin_rostro = ahora
+                if ahora - momento_sin_rostro >= SIN_ROSTRO_ESPERA_SEGUNDOS:
+                    alarma.disparar(NIVEL_SIN_ROSTRO)
 
             # ==============================================================
             # SEÑAL 1: OJOS CERRADOS (EAR)

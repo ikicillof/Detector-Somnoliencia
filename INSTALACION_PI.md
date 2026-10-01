@@ -170,6 +170,10 @@ Patrones de la alarma:
 - **Aviso** (cabeceo brusco): dos pitidos cortos.
 - **Calibración lista:** un pitido muy cortito cuando termina de calibrar
   (ya podés dejar de mirar fijo al frente). No es una alerta.
+- **Rostro perdido:** un "tic" cortísimo cada ~1 segundo mientras la cámara
+  no ve la cara (empieza tras 1 segundo sin verla y se corta apenas la
+  vuelve a ver). Si suena todo el tiempo, revisá la posición de la cámara
+  o la luz.
 
 ---
 
