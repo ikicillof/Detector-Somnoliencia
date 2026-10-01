@@ -24,7 +24,10 @@
 #        posición final.
 #
 # Cualquiera de las tres condiciones (ojos cerrados, cabeza caída, cabeceo
-# brusco) dispara la misma alarma: un pitido y un cartel rojo en pantalla.
+# brusco) dispara la alarma: pitidos y un cartel rojo en pantalla. En la PC
+# suena por los parlantes; en la Raspberry Pi, por un buzzer en un pin GPIO.
+# Hay dos niveles con patrones de pitidos distintos (ver PATRONES_ALARMA):
+# ojos cerrados / cabeza caída = peligro; cabeceo brusco = aviso.
 #
 # ¿QUÉ ES "MEDIAPIPE FACE LANDMARKER"?
 # -------------------------------------
@@ -121,12 +124,10 @@
 import os
 import sys
 import time
+import platform   # Para saber en qué sistema operativo estamos (Windows,
+                  # Linux...) y elegir cómo hacer sonar la alarma.
 import threading
 import urllib.request  # Para descargar el modelo de MediaPipe la primera vez.
-import winsound  # Módulo de Windows para reproducir sonidos simples (pitidos).
-                 # NOTA: el reemplazo multiplataforma (numpy + sounddevice) es
-                 # parte de la fase de "sonido multiplataforma", todavía
-                 # pendiente. Por ahora sigue acá como en la versión anterior.
 from collections import deque, namedtuple  # 'deque': cola doble para guardar
                                # los últimos valores de pitch (suavizado y
                                # velocidad). 'namedtuple': para devolver la
@@ -303,9 +304,28 @@ SIGNO_PITCH = 1.0
 
 # --- Alarma sonora ---
 # Frecuencia del pitido (en Hz, más alto = más agudo) y duración de cada
-# pitido (en milisegundos).
+# pitido (en milisegundos). La frecuencia solo se usa en la PC (por los
+# parlantes); el buzzer activo de la Raspberry Pi tiene un tono fijo.
 ALARM_FREQ_HZ = 2500
 ALARM_DURATION_MS = 700
+
+# Pin GPIO (numeración BCM, NO el número de pin físico) donde está conectada
+# la base del transistor que maneja el buzzer activo en la Raspberry Pi.
+# Ejemplo: GPIO17 = pin físico 11 del conector de 40 pines.
+BUZZER_GPIO = 17
+
+# Patrones de pitidos de cada nivel de alerta, como lista de
+# (segundos_sonando, segundos_en_silencio). Así se distinguen de oído sin
+# mirar la pantalla:
+#   NIVEL_AVISO   -> cabeceo brusco (evento instantáneo): dos pitidos cortos.
+#   NIVEL_PELIGRO -> ojos cerrados o cabeza caída sostenida: un pitido largo
+#                    que se repite mientras dure la condición.
+NIVEL_AVISO = 1
+NIVEL_PELIGRO = 2
+PATRONES_ALARMA = {
+    NIVEL_AVISO: [(0.12, 0.08), (0.12, 0.30)],
+    NIVEL_PELIGRO: [(ALARM_DURATION_MS / 1000.0, 0.10)],
+}
 
 # --- Modelo de MediaPipe ---
 # Dirección de internet de donde se descarga el modelo de detección facial, y
@@ -947,40 +967,244 @@ def procesar_frame(frame, detector_facial, timestamp_ms):
 
 
 # ==============================================================================
-# ALARMA SONORA
+# ALARMA (MULTIPLATAFORMA)
 # ==============================================================================
+#
+# El resto del programa solo conoce la clase 'Alarma' y sus tres métodos:
+#
+#   alarma.disparar(nivel)  -> pide que suene el patrón de ese nivel.
+#   alarma.callar()         -> corta lo que esté sonando.
+#   alarma.cerrar()         -> apaga todo al salir del programa.
+#
+# Por dentro, al arrancar, elige el "backend" (la forma concreta de hacer
+# ruido) según la máquina:
+#
+#   - Raspberry Pi -> buzzer activo por GPIO, a través de un transistor, con
+#                     la librería gpiozero (backend lgpio).
+#   - Windows / PC -> tono por los parlantes, generado con numpy y reproducido
+#                     con sounddevice.
+#   - Si la librería que hace falta no carga (no está instalada, no hay
+#     permisos sobre el GPIO, no hay placa de sonido...) se muestra una
+#     advertencia y la alarma queda solo en pantalla/consola. El programa
+#     NUNCA se corta por culpa de la alarma: detectar somnolencia es más
+#     importante que el sonido.
+#
+# Los pitidos se reproducen en un HILO aparte (un "trabajador" que espera
+# pedidos). Así 'disparar()' vuelve al instante y el bucle de video nunca se
+# congela mientras suena la alarma.
 
-def reproducir_alarma():
-    """Reproduce un pitido de alarma usando el altavoz de la computadora.
+def es_raspberry_pi():
+    """True si el programa está corriendo en una Raspberry Pi.
 
-    Esta función se ejecuta DENTRO DE UN HILO SEPARADO (ver 'threading' más
-    abajo), nunca directamente en el bucle principal de video. La razón es
-    que winsound.Beep() es una función "bloqueante": mientras el pitido está
-    sonando, el programa no puede hacer nada más. Si la llamáramos
-    directamente en el bucle principal, la ventana de video se congelaría
-    (dejaría de actualizarse) durante toda la duración del pitido. Al
-    correrla en un hilo aparte, la cámara y el video pueden seguir
-    funcionando normalmente mientras el sonido se reproduce de fondo."""
-    winsound.Beep(ALARM_FREQ_HZ, ALARM_DURATION_MS)
+    Linux expone el modelo de la placa en /proc/device-tree/model (por
+    ejemplo "Raspberry Pi 4 Model B Rev 1.4"). En Windows o en una PC común
+    ese archivo no existe, y devolvemos False."""
+    if platform.system() != "Linux":
+        return False
+    try:
+        with open("/proc/device-tree/model", "r", errors="ignore") as archivo:
+            return "raspberry pi" in archivo.read().lower()
+    except OSError:
+        return False
 
 
-def disparar_alarma_si_corresponde(hilo_alarma):
-    """Lanza el pitido de alarma en un hilo nuevo, si no hay uno sonando ya.
+class _SalidaBuzzer:
+    """Buzzer activo conectado a un pin GPIO de la Raspberry Pi (vía
+    transistor). Un buzzer ACTIVO suena solo con recibir tensión, así que
+    alcanza con prenderlo y apagarlo."""
 
-    Devuelve el hilo (nuevo o el que ya estaba) para que quien la llama lo
-    siga teniendo a mano. Esta función la comparten las TRES condiciones de
-    alerta (ojos cerrados, cabeza caída y cabeceo brusco): el guard
-    'is_alive()' evita que, si varias se activan casi juntas o una se
-    mantiene varios segundos, se disparen decenas de pitidos superpuestos.
-    Se reproduce un pitido y, apenas termina, si la condición sigue, arranca
-    el siguiente."""
-    if hilo_alarma is None or not hilo_alarma.is_alive():
-        hilo_alarma = threading.Thread(target=reproducir_alarma, daemon=True)
-        # 'daemon=True' significa que este hilo no va a impedir que el
-        # programa se cierre si vos apretás 'q': Python lo corta junto con
-        # todo lo demás al salir.
-        hilo_alarma.start()
-    return hilo_alarma
+    nombre = "buzzer GPIO"
+
+    def __init__(self, pin):
+        # gpiozero puede usar varias librerías de bajo nivel para manejar los
+        # pines; en Raspberry Pi OS actual la que funciona es lgpio. La
+        # elegimos explícitamente, salvo que el usuario haya fijado otra.
+        os.environ.setdefault("GPIOZERO_PIN_FACTORY", "lgpio")
+        from gpiozero import Buzzer  # import acá: solo existe en la Pi
+        self._buzzer = Buzzer(pin)
+        self.nombre = f"buzzer GPIO{pin}"
+
+    def encender(self):
+        self._buzzer.on()
+
+    def apagar(self):
+        self._buzzer.off()
+
+    def cerrar(self):
+        self._buzzer.off()
+        self._buzzer.close()
+
+
+class _SalidaParlante:
+    """Tono senoidal por los parlantes de la computadora, con sounddevice."""
+
+    nombre = "parlantes (sounddevice)"
+    _MUESTRAS_POR_SEG = 44100
+
+    def __init__(self):
+        import sounddevice  # import acá: si falta, se usa el modo sin sonido
+        self._sd = sounddevice
+        # Verificamos que exista un dispositivo de salida; si no, esto lanza
+        # una excepción y caemos al modo sin sonido.
+        self._sd.query_devices(kind="output")
+        self._tonos = {}  # duración -> arreglo con el tono ya generado
+
+    def _tono(self, segundos):
+        """Genera (una sola vez por duración) la onda del pitido."""
+        if segundos not in self._tonos:
+            t = np.arange(int(self._MUESTRAS_POR_SEG * segundos)) / self._MUESTRAS_POR_SEG
+            onda = 0.5 * np.sin(2 * np.pi * ALARM_FREQ_HZ * t)
+            # Rampa de 5 ms al principio y al final para que no haga "clic".
+            rampa = min(len(onda) // 2, int(0.005 * self._MUESTRAS_POR_SEG))
+            if rampa > 0:
+                envolvente = np.linspace(0.0, 1.0, rampa)
+                onda[:rampa] *= envolvente
+                onda[-rampa:] *= envolvente[::-1]
+            self._tonos[segundos] = onda.astype(np.float32)
+        return self._tonos[segundos]
+
+    def encender(self, segundos):
+        # sd.play() NO bloquea: arranca el sonido y vuelve enseguida.
+        self._sd.play(self._tono(segundos), self._MUESTRAS_POR_SEG)
+
+    def apagar(self):
+        self._sd.stop()
+
+    def cerrar(self):
+        self._sd.stop()
+
+
+class Alarma:
+    """Alarma con la misma interfaz en la Raspberry Pi y en la PC. Ver la
+    explicación al principio de esta sección."""
+
+    def __init__(self):
+        self._salida = self._elegir_salida()
+        self.solo_visual = self._salida is None
+
+        # Comunicación con el hilo trabajador: el nivel pedido (0 = nada) y
+        # un "Condition" para despertarlo cuando llega un pedido.
+        self._condicion = threading.Condition()
+        self._nivel_pedido = 0
+        self._cerrando = False
+        # Se activa para interrumpir un patrón a mitad de camino.
+        self._cortar = threading.Event()
+        self._ultimo_aviso_consola = 0.0
+
+        self._hilo = None
+        if not self.solo_visual:
+            self._hilo = threading.Thread(target=self._trabajador, daemon=True)
+            self._hilo.start()
+
+    def _elegir_salida(self):
+        """Prueba la salida que corresponde a esta máquina. Si falla, avisa y
+        devuelve None (alarma solo visual/consola)."""
+        if es_raspberry_pi():
+            try:
+                salida = _SalidaBuzzer(BUZZER_GPIO)
+            except Exception as error:
+                print("ADVERTENCIA: no se pudo usar el buzzer por GPIO "
+                      f"({type(error).__name__}: {error}).")
+                print("  Revisá que estén instalados gpiozero y lgpio, y que "
+                      "tu usuario esté en el grupo 'gpio'.")
+                print("  El programa sigue, pero la alarma va a ser SOLO "
+                      "VISUAL/CONSOLA.")
+                return None
+        else:
+            try:
+                salida = _SalidaParlante()
+            except Exception as error:
+                print("ADVERTENCIA: no se pudo usar el sonido "
+                      f"({type(error).__name__}: {error}).")
+                print("  Revisá que esté instalado sounddevice "
+                      "(pip install sounddevice) y que haya parlantes.")
+                print("  El programa sigue, pero la alarma va a ser SOLO "
+                      "VISUAL/CONSOLA.")
+                return None
+        print(f"Alarma: usando {salida.nombre}.")
+        return salida
+
+    def disparar(self, nivel):
+        """Pide que suene el patrón de 'nivel' (NIVEL_AVISO o NIVEL_PELIGRO).
+        Vuelve al instante. Si ya está sonando un patrón, el pedido queda
+        anotado y se reproduce cuando ese termina; varios pedidos seguidos se
+        juntan en uno solo (gana el nivel más alto). Así, mientras una
+        condición se mantiene, el patrón se repite sin superponerse."""
+        if self.solo_visual:
+            # Sin sonido: avisamos por consola, como mucho una vez por segundo
+            # para no inundarla (el bucle llama a esto en cada frame).
+            ahora = time.time()
+            if ahora - self._ultimo_aviso_consola >= 1.0:
+                self._ultimo_aviso_consola = ahora
+                print("\a*** ALARMA ***", flush=True)  # '\a' = campana de la terminal
+            return
+        with self._condicion:
+            self._nivel_pedido = max(self._nivel_pedido, nivel)
+            self._condicion.notify()
+
+    def callar(self):
+        """Corta el patrón que esté sonando y descarta pedidos pendientes."""
+        if self.solo_visual:
+            return
+        with self._condicion:
+            self._nivel_pedido = 0
+        self._cortar.set()
+
+    def cerrar(self):
+        """Apaga la alarma y termina el hilo. Llamar siempre al salir: en la
+        Pi, si el programa se corta con el buzzer prendido, puede quedar
+        sonando."""
+        if self.solo_visual:
+            return
+        with self._condicion:
+            self._cerrando = True
+            self._nivel_pedido = 0
+            self._condicion.notify()
+        self._cortar.set()
+        if self._hilo is not None:
+            self._hilo.join(timeout=2.0)
+        try:
+            self._salida.cerrar()
+        except Exception:
+            pass
+
+    def _trabajador(self):
+        """Corre en su propio hilo: espera pedidos y reproduce los patrones."""
+        while True:
+            with self._condicion:
+                while self._nivel_pedido == 0 and not self._cerrando:
+                    self._condicion.wait()
+                if self._cerrando:
+                    return
+                nivel = self._nivel_pedido
+                self._nivel_pedido = 0
+                self._cortar.clear()
+            try:
+                self._reproducir(PATRONES_ALARMA[nivel])
+            except Exception as error:
+                # Un error de audio/GPIO a mitad de camino no debe matar el
+                # hilo ni el programa: avisamos y seguimos.
+                print(f"ADVERTENCIA: fallo al hacer sonar la alarma: {error}")
+            finally:
+                try:
+                    self._salida.apagar()
+                except Exception:
+                    pass
+
+    def _reproducir(self, patron):
+        """Reproduce un patrón (lista de (sonando, silencio) en segundos).
+        Usa Event.wait() en lugar de time.sleep() para poder cortarlo al
+        instante con callar() o cerrar()."""
+        for sonando, silencio in patron:
+            if isinstance(self._salida, _SalidaParlante):
+                self._salida.encender(sonando)
+            else:
+                self._salida.encender()
+            if self._cortar.wait(sonando):
+                return
+            self._salida.apagar()
+            if self._cortar.wait(silencio):
+                return
 
 
 # ==============================================================================
@@ -1098,9 +1322,9 @@ def main():
     # contador de tiempo no se reinicia por oscilaciones del EAR en el límite.
     ojos_cerrados_estado = False
 
-    # Referencia al hilo del pitido de alarma, para no lanzar varios pitidos
-    # superpuestos al mismo tiempo.
-    hilo_alarma = None
+    # Alarma (buzzer en la Pi, parlantes en la PC, o solo visual si ninguno
+    # funciona). Nunca bloquea el bucle: los pitidos suenan en otro hilo.
+    alarma = Alarma()
 
     # Momento del último cabeceo brusco confirmado (None si no hubo, o si ya
     # pasó su tiempo en pantalla). El cartel se mantiene visible unos
@@ -1179,7 +1403,7 @@ def main():
 
             if segundos_ojos_cerrados >= DROWSY_TIME_SECONDS:
                 dibujar_alerta_ojos(lienzo)
-                hilo_alarma = disparar_alarma_si_corresponde(hilo_alarma)
+                alarma.disparar(NIVEL_PELIGRO)
 
         # ==================================================================
         # SEÑAL 2: CABECEOS (POSE DE LA CABEZA)
@@ -1191,12 +1415,12 @@ def main():
 
             if cabeza_caida:
                 dibujar_alerta_cabeza_caida(lienzo)
-                hilo_alarma = disparar_alarma_si_corresponde(hilo_alarma)
+                alarma.disparar(NIVEL_PELIGRO)
 
             if cabeceo_brusco:
                 print("ALERTA: cabeceo brusco detectado.")
                 momento_alerta_cabeceo = ahora
-                hilo_alarma = disparar_alarma_si_corresponde(hilo_alarma)
+                alarma.disparar(NIVEL_AVISO)
 
         # Mantenemos el cartel de cabeceo unos segundos después del evento.
         if momento_alerta_cabeceo is not None:
@@ -1230,6 +1454,7 @@ def main():
     captura.release()
     cv2.destroyAllWindows()
     detector_facial.close()
+    alarma.cerrar()  # en la Pi, deja el buzzer apagado sí o sí
 
 
 # Este bloque hace que 'main()' se ejecute solo cuando corrés este archivo
